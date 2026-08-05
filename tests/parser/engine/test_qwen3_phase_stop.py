@@ -87,18 +87,40 @@ class TestPhaseDetection:
 
 
 class TestRequestWiring:
-    def test_apply_endoftext_ban_sets_logit_bias_and_bad_words(self):
+    def test_apply_endoftext_ban_sets_bad_words_not_logit_bias(self):
+        """logit_bias is forbidden with MTP — ban via bad_words only."""
         req = MagicMock()
         req.logit_bias = None
         req.bad_words = []
         req.vllm_xargs = None
         apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
-        assert req.logit_bias[str(_EOT)] == -100.0
+        assert req.logit_bias is None
         assert QWEN_END_OF_TEXT in req.bad_words
         assert PHASE_BAN_XARG_KEY in req.vllm_xargs
         cfg = parse_phase_ban_config(req.vllm_xargs)
         assert cfg is not None
         assert cfg[0] == _IM_END
+
+    def test_endoftext_ban_compatible_with_speculative_verify(self):
+        """Regression: adjust_request must not trip MTP logit_bias reject."""
+        from unittest.mock import MagicMock
+
+        from vllm.sampling_params import SamplingParams
+
+        req = MagicMock()
+        req.logit_bias = None
+        req.bad_words = []
+        req.vllm_xargs = None
+        apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=False)
+
+        params = SamplingParams(
+            max_tokens=16,
+            bad_words=list(req.bad_words),
+            logit_bias=req.logit_bias,
+            extra_args=dict(req.vllm_xargs) if req.vllm_xargs else None,
+        )
+        # Must not raise (stock image + MTP works; our old logit_bias broke it).
+        params._validate_spec_decode(speculative_config=object())
 
     def test_banned_ids_for_request_in_reasoning(self):
         extra = {

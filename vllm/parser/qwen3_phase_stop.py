@@ -8,9 +8,11 @@ Product invariants:
 2. ``<|im_end|>`` is phase-aware: banned while the accepted output is still
    in REASONING or an open TOOL region; allowed in CONTENT outside tools.
 
-These helpers are designed for the GPU sampler / ``bad_words`` path so they
-remain usable when speculative decoding (MTP) disables custom logits
-processors and the legacy ``LogitBiasLogitsProcessor``.
+These helpers intentionally avoid ``logit_bias`` (rejected by
+``SamplingParams._validate_spec_decode`` under MTP). Endoftext is banned
+via ``bad_words``; phase-aware ``im_end`` uses the builtin
+``Qwen3PhaseStopLogitsProcessor`` (kept under speculative decoding) and
+``check_stop`` as a safety net.
 """
 
 from __future__ import annotations
@@ -61,21 +63,16 @@ def apply_endoftext_ban_to_request(
 ) -> None:
     """Ban ``<|endoftext|>`` and enable phase-aware ``im_end`` bans.
 
-    - ``logit_bias`` / ``bad_words``: always ban endoftext (MTP-safe via
-      ``bad_words`` on both sampler paths).
-    - ``vllm_xargs[qwen3_phase_ban]``: flattened ids consumed by samplers /
-      ``check_stop`` for phase-aware ``im_end`` masking.
+    Do **not** set ``logit_bias``: ``SamplingParams._validate_spec_decode``
+    rejects it when MTP / speculative decoding is enabled (the qwen36-27b
+    production path). Use ``bad_words`` instead — that path works with
+    drafts on both sampler implementations.
+
+    ``vllm_xargs[qwen3_phase_ban]`` carries flattened ids for the builtin
+    ``Qwen3PhaseStopLogitsProcessor`` / ``check_stop`` im_end masking.
     """
     eot_id = resolve_endoftext_token_id(vocab)
     if eot_id is not None:
-        logit_bias = getattr(request, "logit_bias", None)
-        if logit_bias is None:
-            request.logit_bias = {str(eot_id): -100.0}
-        else:
-            key = str(eot_id)
-            if key not in logit_bias and eot_id not in logit_bias:
-                logit_bias[key] = -100.0
-
         bad_words = getattr(request, "bad_words", None)
         if bad_words is None:
             # ResponsesRequest has no bad_words field — skip quietly.
