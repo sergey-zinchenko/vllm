@@ -32,8 +32,10 @@ if TYPE_CHECKING:
 
 @functools.cache
 def nemotron_v3_config(thinking: bool = True) -> ParserEngineConfig:
+    # Keep legacy Qwen3 behavior: <tool_call> may implicitly end reasoning.
+    # Hardened Qwen3 (tool_call_ends_reasoning=False) is opt-in via qwen3_config.
     return dataclasses.replace(
-        qwen3_config(thinking=thinking),
+        qwen3_config(thinking=thinking, tool_call_ends_reasoning=True),
         name="nemotron_v3",
         strip_trailing_reasoning_whitespace=True,
     )

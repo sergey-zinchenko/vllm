@@ -94,7 +94,97 @@ def qwen3_config(
     think_end: str = THINK_END,
     tool_start: str = TOOL_CALL_START,
     tool_end: str = TOOL_CALL_END,
+    tool_call_ends_reasoning: bool = False,
+    orphan_func_prefix: bool = False,
+    validate_tool_names: bool = True,
 ) -> ParserEngineConfig:
+    """Build the Qwen3-family parser config.
+
+    Args:
+        thinking: Start in REASONING when True, else CONTENT.
+        tool_call_ends_reasoning: Legacy behavior — bare ``<tool_call>``
+            ends think and starts a tool (Nemotron V3). Hardened Qwen3
+            keeps this False so markup inside think is plain text.
+        orphan_func_prefix: Legacy — bare ``<function=`` in CONTENT starts
+            a tool. Hardened Qwen3 keeps this False.
+        validate_tool_names: Reject tool names absent from ``request.tools``.
+    """
+    transitions: dict[tuple[ParserState, str], Transition] = {
+        # -- Reasoning transitions --
+        (ParserState.REASONING, "THINK_START"): Transition(
+            ParserState.REASONING,
+            (),
+        ),
+        (ParserState.REASONING, "THINK_END"): Transition(
+            ParserState.CONTENT,
+            (EventType.REASONING_END,),
+        ),
+        # Absorb duplicate </think> — model may emit it after
+        # already transitioning to CONTENT; drop it silently.
+        (ParserState.CONTENT, "THINK_END"): Transition(
+            ParserState.CONTENT,
+            (),
+        ),
+        # -- Tool call transitions --
+        (ParserState.CONTENT, "TOOL_START"): Transition(
+            ParserState.TOOL_PREAMBLE,
+            (EventType.TOOL_CALL_START,),
+        ),
+        (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
+            ParserState.CONTENT,
+            (EventType.TOOL_CALL_END,),
+        ),
+        (ParserState.TOOL_PREAMBLE, "FUNC_PREFIX"): Transition(
+            ParserState.TOOL_NAME,
+            (),
+        ),
+        (ParserState.TOOL_NAME, "CLOSE_ANGLE"): Transition(
+            ParserState.TOOL_ARGS,
+            (),
+        ),
+        # Malformed: </function> while still in TOOL_NAME (no closing >)
+        (ParserState.TOOL_NAME, "FUNC_END"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.TOOL_CALL_END,),
+        ),
+        (ParserState.TOOL_ARGS, "FUNC_END"): Transition(
+            ParserState.TOOL_BETWEEN,
+            (EventType.TOOL_CALL_END,),
+        ),
+        (ParserState.TOOL_ARGS, "PARAM_START"): Transition(
+            ParserState.TOOL_ARGS,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_ARGS, "PARAM_END"): Transition(
+            ParserState.TOOL_ARGS,
+            (EventType.ARG_VALUE_CHUNK,),
+        ),
+        (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
+            ParserState.CONTENT,
+            (),
+        ),
+        # Consecutive tool call without closing </tool_call>
+        (ParserState.TOOL_BETWEEN, "TOOL_START"): Transition(
+            ParserState.TOOL_PREAMBLE,
+            (EventType.TOOL_CALL_START,),
+        ),
+        (ParserState.TOOL_BETWEEN, "FUNC_PREFIX"): Transition(
+            ParserState.TOOL_NAME,
+            (EventType.TOOL_CALL_START,),
+        ),
+    }
+    if tool_call_ends_reasoning:
+        # Legacy: <tool_call> from REASONING implicitly ends think.
+        transitions[(ParserState.REASONING, "TOOL_START")] = Transition(
+            ParserState.TOOL_PREAMBLE,
+            (EventType.REASONING_END, EventType.TOOL_CALL_START),
+        )
+    if orphan_func_prefix:
+        transitions[(ParserState.CONTENT, "FUNC_PREFIX")] = Transition(
+            ParserState.TOOL_NAME,
+            (EventType.TOOL_CALL_START,),
+        )
+
     return ParserEngineConfig(
         name=name,
         initial_state=ParserState.REASONING if thinking else ParserState.CONTENT,
@@ -117,80 +207,12 @@ def qwen3_config(
             "TOOL_START": tool_start,
             "TOOL_END": tool_end,
         },
-        transitions={
-            # -- Reasoning transitions --
-            (ParserState.REASONING, "THINK_START"): Transition(
-                ParserState.REASONING,
-                (),
-            ),
-            (ParserState.REASONING, "THINK_END"): Transition(
-                ParserState.CONTENT,
-                (EventType.REASONING_END,),
-            ),
-            # Absorb duplicate </think> — model may emit it after
-            # already transitioning to CONTENT; drop it silently.
-            (ParserState.CONTENT, "THINK_END"): Transition(
-                ParserState.CONTENT,
-                (),
-            ),
-            # NOTE: No (REASONING, TOOL_START) transition — tool markup
-            # inside <think>…</think> stays plain reasoning text. Reasoning
-            # ends only on THINK_END.
-            # -- Tool call transitions --
-            (ParserState.CONTENT, "TOOL_START"): Transition(
-                ParserState.TOOL_PREAMBLE,
-                (EventType.TOOL_CALL_START,),
-            ),
-            # NOTE: No (CONTENT, FUNC_PREFIX) orphan transition — bare
-            # <function= without a preceding <tool_call> stays content.
-            (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
-                ParserState.CONTENT,
-                (EventType.TOOL_CALL_END,),
-            ),
-            (ParserState.TOOL_PREAMBLE, "FUNC_PREFIX"): Transition(
-                ParserState.TOOL_NAME,
-                (),
-            ),
-            (ParserState.TOOL_NAME, "CLOSE_ANGLE"): Transition(
-                ParserState.TOOL_ARGS,
-                (),
-            ),
-            # Malformed: </function> while still in TOOL_NAME (no closing >)
-            (ParserState.TOOL_NAME, "FUNC_END"): Transition(
-                ParserState.TOOL_BETWEEN,
-                (EventType.TOOL_CALL_END,),
-            ),
-            (ParserState.TOOL_ARGS, "FUNC_END"): Transition(
-                ParserState.TOOL_BETWEEN,
-                (EventType.TOOL_CALL_END,),
-            ),
-            (ParserState.TOOL_ARGS, "PARAM_START"): Transition(
-                ParserState.TOOL_ARGS,
-                (EventType.ARG_VALUE_CHUNK,),
-            ),
-            (ParserState.TOOL_ARGS, "PARAM_END"): Transition(
-                ParserState.TOOL_ARGS,
-                (EventType.ARG_VALUE_CHUNK,),
-            ),
-            (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
-                ParserState.CONTENT,
-                (),
-            ),
-            # Consecutive tool call without closing </tool_call>
-            (ParserState.TOOL_BETWEEN, "TOOL_START"): Transition(
-                ParserState.TOOL_PREAMBLE,
-                (EventType.TOOL_CALL_START,),
-            ),
-            (ParserState.TOOL_BETWEEN, "FUNC_PREFIX"): Transition(
-                ParserState.TOOL_NAME,
-                (EventType.TOOL_CALL_START,),
-            ),
-        },
+        transitions=transitions,
         arg_converter=_qwen3_arg_converter,
         stream_arg_deltas=True,
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,
-        validate_tool_names=True,
+        validate_tool_names=validate_tool_names,
     )
 
 
@@ -243,6 +265,13 @@ class Qwen3Parser(ParserEngine):
             tools,
             **kwargs,
         )
+        self._tool_call_ends_reasoning = (
+            ParserState.REASONING,
+            "TOOL_START",
+        ) in self.parser_engine_config.transitions
+        vocab = self.vocab
+        self._tool_call_token_id: int | None = vocab.get(self.TOOL_START)
+        self._tool_call_end_token_id: int | None = vocab.get(self.TOOL_END)
 
     def extract_reasoning(
         self,
@@ -254,13 +283,37 @@ class Qwen3Parser(ParserEngine):
         return super().extract_reasoning(model_output, request)
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
-        """Reasoning ends only on ``</think>`` — never on tool_call."""
-        return super().is_reasoning_end(input_ids)
+        """Hardened: only ``</think>``. Legacy: unpaired ``<tool_call>`` too."""
+        if super().is_reasoning_end(input_ids):
+            return True
+        if not self._tool_call_ends_reasoning:
+            return False
+        tool_call_id = self._tool_call_token_id
+        tool_call_end_id = self._tool_call_end_token_id
+        reasoning_start_id = self._reasoning_start_token_id
+        if tool_call_id is not None:
+            for i in range(len(input_ids) - 1, -1, -1):
+                if (
+                    reasoning_start_id is not None
+                    and input_ids[i] == reasoning_start_id
+                ):
+                    return False
+                if input_ids[i] == tool_call_id:
+                    if tool_call_end_id is not None and any(
+                        input_ids[j] == tool_call_end_id
+                        for j in range(i + 1, len(input_ids))
+                    ):
+                        continue
+                    return True
+        return False
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request = super().adjust_request(request)
+        # Phase-stop wiring is Qwen3-hardened only (not Nemotron legacy).
+        if self._tool_call_ends_reasoning or self.CONFIG_NAME != "qwen3":
+            return request
         from vllm.parser.qwen3_phase_stop import apply_endoftext_ban_to_request
 
         apply_endoftext_ban_to_request(
