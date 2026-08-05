@@ -3,10 +3,11 @@
 """Tests for the engine-based Qwen3 reasoning parser.
 
 Validates that ``Qwen3Parser`` correctly handles
-``<think>``/``</think>`` reasoning with Qwen3-specific extensions:
-- ``<tool_call>`` as implicit reasoning end (terminal + token ID)
+``<think>``/``</think>`` reasoning with Qwen3 hardened invariants:
+- Tool markup inside think stays reasoning text (never implicit end)
+- Reasoning ends only on ``</think>``
 - Stripping ``<think>`` from generated output (old template compat)
-- No terminal text (``</think>``, ``<tool_call>``) leaks into output
+- No ``</think>`` terminal text leaks into output
 """
 
 import dataclasses
@@ -88,8 +89,8 @@ class TestNonStreaming:
         assert "Step 3" in reasoning
         assert content == "Result: 7."
 
-    def test_tool_call_implicit_end(self, parser):
-        """<tool_call> without </think> acts as implicit reasoning end."""
+    def test_tool_call_inside_think_stays_reasoning(self, parser):
+        """Tool markup inside <think> stays plain reasoning text."""
         text = (
             "<think>I need to read the file.\n\n"
             "<tool_call>\n<function=bash>\n"
@@ -97,12 +98,14 @@ class TestNonStreaming:
             "</function>\n</tool_call>"
         )
         reasoning, content = parser.extract_reasoning(text, None)
-        assert reasoning == "I need to read the file.\n\n"
-        assert "</think>" not in reasoning
-        assert "<tool_call>" not in reasoning
+        assert reasoning is not None
+        assert "<tool_call>" in reasoning
+        assert "<function=bash>" in reasoning
+        assert content is None
+        assert not parser.is_reasoning_end([_THINK_START_ID, 1, _TOOL_CALL_ID])
 
-    def test_tool_call_implicit_end_no_think(self, parser):
-        """<tool_call> as implicit end, no <think> in output."""
+    def test_tool_call_without_think_end_stays_reasoning(self, parser):
+        """Without </think>, tool markup remains reasoning (truncated)."""
         text = (
             "I need to read the file.\n\n"
             "<tool_call>\n<function=bash>\n"
@@ -110,8 +113,9 @@ class TestNonStreaming:
             "</function>\n</tool_call>"
         )
         reasoning, content = parser.extract_reasoning(text, None)
-        assert reasoning == "I need to read the file.\n\n"
-        assert "<tool_call>" not in reasoning
+        assert reasoning is not None
+        assert "<tool_call>" in reasoning
+        assert content is None
 
     def test_live_scenario_think_end_before_tool_call(self, parser):
         """Real model output: </think> immediately before <tool_call>.
@@ -168,22 +172,22 @@ class TestIsReasoningEnd:
     def test_start_after_end_means_not_ended(self, parser):
         assert not parser.is_reasoning_end([_THINK_END_ID, _THINK_START_ID, 1])
 
-    def test_tool_call_as_implicit_end(self, parser):
-        """Unpaired <tool_call> is implicit reasoning end."""
-        assert parser.is_reasoning_end([_THINK_START_ID, 1, _TOOL_CALL_ID])
+    def test_tool_call_never_ends_reasoning(self, parser):
+        """Unpaired <tool_call> must NOT end reasoning (hardened invariant)."""
+        assert not parser.is_reasoning_end([_THINK_START_ID, 1, _TOOL_CALL_ID])
 
     def test_prompt_tool_example_before_generation_think_not_end(self, parser):
         """Tool examples before the generation <think> must not end reasoning."""
         assert not parser.is_reasoning_end([_TOOL_CALL_ID, _TEXT_ID, _THINK_START_ID])
 
     def test_paired_tool_call_not_end(self, parser):
-        """Paired <tool_call>...</tool_call> (from template) is NOT end."""
+        """Paired <tool_call>...</tool_call> inside think is NOT end."""
         assert not parser.is_reasoning_end(
             [_THINK_START_ID, 1, _TOOL_CALL_ID, 2, _TOOL_CALL_END_ID]
         )
 
     def test_tool_call_after_think_end(self, parser):
-        """<tool_call> after </think> — already ended."""
+        """<tool_call> after </think> — already ended via think_end."""
         assert parser.is_reasoning_end(
             [_THINK_START_ID, 1, _THINK_END_ID, _TOOL_CALL_ID]
         )
@@ -257,8 +261,8 @@ class TestStreaming:
         assert reasoning == "reasoning"
         assert content == "content"
 
-    def test_streaming_tool_call_implicit_end(self, parser):
-        """<tool_call> ends reasoning implicitly during streaming."""
+    def test_streaming_tool_call_stays_in_reasoning(self, parser):
+        """<tool_call> inside think streams as reasoning, not content."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
             ["I need to check.", "<tool_call>", "\n<function=test>"],
@@ -268,10 +272,9 @@ class TestStreaming:
                 (2,),
             ],
         )
-        assert reasoning == "I need to check."
-        assert "<tool_call>" not in reasoning
-        assert "</think>" not in reasoning
-        assert content is not None
+        assert "I need to check." in reasoning
+        assert "<tool_call>" in reasoning
+        assert content == ""
 
     def test_streaming_content_after_think_end(self, parser):
         """Content deltas after </think> are routed as content."""
@@ -288,20 +291,20 @@ class TestStreaming:
         assert reasoning == "reasoning"
         assert content == "content1 content2"
 
-    def test_streaming_content_after_tool_call(self, parser):
-        """Content deltas after <tool_call> are routed as content."""
+    def test_streaming_tool_markup_after_think_end_is_content(self, parser):
+        """After </think>, tool markup is handled by the tool FSM (content)."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["thinking", "<tool_call>", "<function=f>"],
+            ["thinking", "</think>", "<tool_call>", "<function=f>"],
             [
                 (1,),
+                (_THINK_END_ID,),
                 (_TOOL_CALL_ID,),
                 (2,),
             ],
         )
         assert reasoning == "thinking"
         assert "<tool_call>" not in reasoning
-        assert content is not None
 
     def test_streaming_end_grouped_with_content(self, parser):
         """</think> grouped with following content in one delta."""
@@ -482,8 +485,10 @@ class TestTrailingWhitespaceStripping:
         assert reasoning == "Step 1.\n\nStep 2."
         assert content == "Answer"
 
-    def test_streaming_trailing_newlines_before_tool_call(self, parser_with_strip):
-        """Trailing newlines before implicit <tool_call> end are stripped."""
+    def test_streaming_trailing_newlines_before_tool_call_in_think(
+        self, parser_with_strip
+    ):
+        """Tool markup in think stays reasoning; strip only applies at </think>."""
         reasoning, content = simulate_reasoning_streaming(
             parser_with_strip,
             ["I'll check.\n\n", "<tool_call>", "<function=test>"],
@@ -493,8 +498,9 @@ class TestTrailingWhitespaceStripping:
                 (2,),
             ],
         )
-        assert reasoning == "I'll check."
-        assert "<tool_call>" not in reasoning
+        assert "I'll check." in reasoning
+        assert "<tool_call>" in reasoning
+        assert content == ""
 
 
 class TestWhitespaceStrippingDisabled:

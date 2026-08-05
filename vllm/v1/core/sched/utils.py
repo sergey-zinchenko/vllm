@@ -101,6 +101,19 @@ def check_stop(request: Request, max_model_len: int) -> bool:
         return False
 
     last_token_id = request.output_token_ids[-1]
+
+    # Qwen3 hardened parser: ignore im_end while still in think / open tool.
+    # Defense-in-depth if the token slips past the phase logits ban (e.g. GPU
+    # V2 sampler path without the builtin logits processor).
+    from vllm.parser.qwen3_phase_stop import should_ignore_stop_token
+
+    if should_ignore_stop_token(
+        last_token_id,
+        request.output_token_ids[:-1],
+        sampling_params.extra_args,
+    ):
+        return False
+
     if last_token_id == sampling_params.eos_token_id:
         request.status = RequestStatus.FINISHED_STOPPED
         return True

@@ -1175,3 +1175,162 @@ class TestNestedSchemaCoercion:
         assert questions[0]["question"] == "Pick a color"
         assert questions[0]["multiSelect"] is False
         assert questions[0]["answer"] is None
+
+
+class TestHardenedInvariants:
+    """Qwen3 hardened emit rules: no orphan tools, validate names, lookalikes."""
+
+    @pytest.fixture
+    def tools(self):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        return [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "note": {"type": "string"},
+                        },
+                    },
+                },
+            )
+        ]
+
+    @pytest.fixture
+    def parser_with_tools(self, mock_tokenizer, tools):
+        return ParserEngine(
+            mock_tokenizer,
+            tools=tools,
+            parser_engine_config=qwen3_config(thinking=False),
+        )
+
+    def test_orphan_function_prefix_stays_content(self, parser, mock_request):
+        text = "Use <function=get_weather> in docs; not a real invoke."
+        result = parser.extract_tool_calls(text, mock_request)
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert "<function=get_weather>" in (result.content or "")
+
+    def test_markdown_fenced_lookalike_stays_content(
+        self, parser_with_tools, mock_request
+    ):
+        text = (
+            "Here is an example:\n"
+            "```xml\n"
+            "<tool_call>\n"
+            "<function=not_a_real_tool>\n"
+            "<parameter=x>1</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "```\n"
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert "<tool_call>" in (result.content or "")
+        assert "not_a_real_tool" in (result.content or "")
+
+    def test_invalid_tool_name_flushed_as_content(
+        self, parser_with_tools, mock_request
+    ):
+        text = (
+            "<tool_call>\n"
+            "<function=unknown_tool>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert "unknown_tool" in (result.content or "")
+
+    def test_valid_tool_still_emits(self, parser_with_tools, mock_request):
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+
+    def test_param_with_nested_fake_tags(self, parser_with_tools, mock_request):
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=note>contains <|im_end|> and "
+            "<tool_call>fake</tool_call></parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert "<|im_end|>" in args["note"]
+        assert "<tool_call>" in args["note"]
+
+    def test_streaming_split_tags_valid_tool(self, parser_with_tools, mock_request):
+        chunks = [
+            "<tool_call>\n",
+            "<funct",
+            "ion=get_weather>\n",
+            "<parameter=city>Tok",
+            "yo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser_with_tools, mock_request, chunks)
+        assert collect_function_name(results) == "get_weather"
+        args = json.loads(collect_tool_arguments(results))
+        assert args["city"] == "Tokyo"
+
+    def test_streaming_invalid_name_becomes_content(
+        self, parser_with_tools, mock_request
+    ):
+        chunks = [
+            "<tool_call>\n",
+            "<function=nope>\n",
+            "<parameter=city>Tokyo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser_with_tools, mock_request, chunks)
+        names = []
+        for delta, _ in results:
+            if delta and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.function and tc.function.name:
+                        names.append(tc.function.name)
+        assert names == []
+        content = collect_content(results)
+        assert "nope" in content
+
+    def test_thinking_disabled_real_tool(self, mock_tokenizer, tools, mock_request):
+        from vllm.parser.qwen3 import Qwen3Parser
+
+        parser = Qwen3Parser(
+            mock_tokenizer,
+            tools=tools,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Paris</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text, mock_request)
+        assert result.tools_called is True
+        assert result.tool_calls[0].function.name == "get_weather"

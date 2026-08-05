@@ -123,6 +123,8 @@ class ParserEngine(Parser):
         self._deferred_reasoning: str = ""
         self._content_has_nonws: bool = False
         self._suppress_tool_calls: bool = False
+        # Raw XML spans for tool calls rejected by validate_tool_names.
+        self._rejected_tool_content: list[str] = []
 
         self._arg_converter = parser_engine_config.arg_converter
         self._arg_structural_chars = parser_engine_config.arg_structural_chars
@@ -200,6 +202,7 @@ class ParserEngine(Parser):
         self._deferred_reasoning = ""
         self._content_has_nonws = False
         self._prompt_streaming_prepared = False
+        self._rejected_tool_content.clear()
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -757,6 +760,10 @@ class ParserEngine(Parser):
             content_parts.insert(0, self._deferred_content)
             self._deferred_content = ""
 
+        if self._rejected_tool_content:
+            content_parts.extend(self._rejected_tool_content)
+            self._rejected_tool_content.clear()
+
         content_str = "".join(content_parts)
 
         if self._content_has_nonws:
@@ -856,6 +863,17 @@ class ParserEngine(Parser):
                     )
                 )
 
+    def _format_rejected_tool_content(self, slot: ToolCallSlot) -> str:
+        """Rebuild a rejected tool span as ordinary content text."""
+        terminals = self.parser_engine_config.terminals
+        tool_start = terminals.get("TOOL_START", "<tool_call>")
+        tool_end = terminals.get("TOOL_END", "</tool_call>")
+        func_prefix = terminals.get("FUNC_PREFIX", "<function=")
+        func_end = terminals.get("FUNC_END", "</function>")
+        name = slot.name or ""
+        args = slot.args or ""
+        return f"{tool_start}\n{func_prefix}{name}>{args}{func_end}\n{tool_end}"
+
     def _handle_tool_end(
         self,
         event: SemanticEvent,
@@ -887,6 +905,15 @@ class ParserEngine(Parser):
                             arguments=remaining or "",
                         ),
                     )
+                )
+                remaining = None
+            elif self.parser_engine_config.validate_tool_names:
+                # Invalid / missing name → flush entire span as content
+                # (Qwen3 hardened invariant). Other parsers keep prior
+                # silent-drop behavior when validate_tool_names is off.
+                slot.name = name
+                self._rejected_tool_content.append(
+                    self._format_rejected_tool_content(slot)
                 )
                 remaining = None
 

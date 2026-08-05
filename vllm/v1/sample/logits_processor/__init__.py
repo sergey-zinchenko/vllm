@@ -19,6 +19,7 @@ from vllm.v1.sample.logits_processor.builtin import (
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
     MinTokensLogitsProcessor,
+    Qwen3PhaseStopLogitsProcessor,
     process_dict_updates,
 )
 from vllm.v1.sample.logits_processor.interface import (
@@ -51,6 +52,7 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
     MinPLogitsProcessor,
+    Qwen3PhaseStopLogitsProcessor,
 ]
 
 
@@ -205,8 +207,12 @@ def build_logitsprocs(
         logger.warning(
             "min_p and logit_bias parameters won't work with speculative decoding."
         )
+        # Keep min-tokens + Qwen3 phase-aware im_end ban under MTP.
         return LogitsProcessors(
-            [MinTokensLogitsProcessor(vllm_config, device, is_pin_memory)]
+            [
+                MinTokensLogitsProcessor(vllm_config, device, is_pin_memory),
+                Qwen3PhaseStopLogitsProcessor(vllm_config, device, is_pin_memory),
+            ]
         )
 
     custom_logitsprocs_classes = _load_custom_logitsprocs(custom_logitsprocs)

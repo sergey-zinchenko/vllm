@@ -286,6 +286,144 @@ class MinTokensLogitsProcessor(LogitsProcessor):
         return logits
 
 
+class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
+    """Phase-aware ``<|im_end|>`` ban for Qwen3 hardened serving.
+
+    While accepted output is still in REASONING or an open TOOL region,
+    ``im_end`` logits are set to ``-inf``. Works with speculative decoding
+    via :meth:`apply_with_spec_decode` (same pattern as min-tokens).
+    """
+
+    def __init__(
+        self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
+    ):
+        from vllm.parser.qwen3_phase_stop import parse_phase_ban_config
+
+        self._parse_phase_ban_config = parse_phase_ban_config
+        self.device = device
+        # index -> (im_end_id, output_tok_ids, think_start, think_end,
+        #           tool_start, tool_end, initial_reasoning)
+        self.reqs: dict[
+            int,
+            tuple[
+                int,
+                Sequence[int],
+                int | None,
+                int | None,
+                int | None,
+                int | None,
+                bool,
+            ],
+        ] = {}
+        self.neg_inf_tensor = torch.tensor(
+            -float("inf"), dtype=torch.float32, device=self.device
+        )
+
+    def is_argmax_invariant(self) -> bool:
+        return False
+
+    def add_request(
+        self,
+        params: SamplingParams,
+        _: list[int] | None,
+        output_tok_ids: list[int],
+    ) -> (
+        tuple[int, Sequence[int], int | None, int | None, int | None, int | None, bool]
+        | None
+    ):
+        cfg = self._parse_phase_ban_config(params.extra_args)
+        if cfg is None:
+            return None
+        im_end_id, think_start, think_end, tool_start, tool_end, initial = cfg
+        return (
+            im_end_id,
+            output_tok_ids,
+            think_start,
+            think_end,
+            tool_start,
+            tool_end,
+            initial,
+        )
+
+    def _active_ban_reqs(self) -> list[tuple[int, int]]:
+        from vllm.parser.qwen3_phase_stop import is_in_reasoning_or_tool_phase
+
+        active: list[tuple[int, int]] = []
+        for req_idx, (
+            im_end_id,
+            out_tok_ids,
+            think_start,
+            think_end,
+            tool_start,
+            tool_end,
+            initial,
+        ) in self.reqs.items():
+            if is_in_reasoning_or_tool_phase(
+                out_tok_ids,
+                think_start_id=think_start,
+                think_end_id=think_end,
+                tool_start_id=tool_start,
+                tool_end_id=tool_end,
+                initial_reasoning=initial,
+            ):
+                active.append((req_idx, im_end_id))
+        return active
+
+    def update_state(self, batch_update: BatchUpdate | None):
+        process_dict_updates(self.reqs, batch_update, self.add_request)
+
+    def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
+        return async_tensor_h2d(data, device=self.device, dtype=dtype)
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        # Recompute each step — output_tok_ids lists are live references.
+        active = self._active_ban_reqs()
+        if not active:
+            return logits
+        reqs = [r for r, _ in active]
+        toks = [t for _, t in active]
+        logits_slice = (
+            self._device_tensor(reqs, torch.int32),
+            self._device_tensor(toks, torch.int32),
+        )
+        logits.index_put_(logits_slice, self.neg_inf_tensor)
+        return logits
+
+    def apply_with_spec_decode(
+        self,
+        logits: torch.Tensor,
+        num_draft_tokens: list[int],
+    ) -> torch.Tensor:
+        """Ban ``im_end`` on all draft rows while still in ban phase."""
+        active = self._active_ban_reqs()
+        if not active:
+            return logits
+
+        num_draft_arr = np.array(num_draft_tokens, dtype=np.int64)
+        cumsum = np.concatenate([[0], np.cumsum(num_draft_arr)])
+        all_rows: list[np.ndarray] = []
+        all_toks: list[np.ndarray] = []
+
+        active_map = {req_idx: im_end for req_idx, im_end in active}
+        for req_idx, im_end_id in active_map.items():
+            n = int(num_draft_arr[req_idx])
+            if n <= 0:
+                continue
+            offset = cumsum[req_idx]
+            all_rows.append(np.arange(offset, offset + n, dtype=np.int64))
+            all_toks.append(np.full(n, im_end_id, dtype=np.int64))
+
+        if all_rows:
+            rows_arr = np.concatenate(all_rows)
+            toks_arr = np.concatenate(all_toks)
+            logits_slice = (
+                async_tensor_h2d(rows_arr, device=self.device),
+                async_tensor_h2d(toks_arr, device=self.device),
+            )
+            logits.index_put_(logits_slice, self.neg_inf_tensor)
+        return logits
+
+
 def process_dict_updates(
     req_entries: dict[int, T],
     batch_update: BatchUpdate | None,

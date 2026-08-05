@@ -133,21 +133,16 @@ def qwen3_config(
                 ParserState.CONTENT,
                 (),
             ),
-            # Tool call directly from reasoning (implicit end)
-            (ParserState.REASONING, "TOOL_START"): Transition(
-                ParserState.TOOL_PREAMBLE,
-                (EventType.REASONING_END, EventType.TOOL_CALL_START),
-            ),
+            # NOTE: No (REASONING, TOOL_START) transition — tool markup
+            # inside <think>…</think> stays plain reasoning text. Reasoning
+            # ends only on THINK_END.
             # -- Tool call transitions --
             (ParserState.CONTENT, "TOOL_START"): Transition(
                 ParserState.TOOL_PREAMBLE,
-                (EventType.REASONING_END, EventType.TOOL_CALL_START),
-            ),
-            # Fallback: <function= without a preceding <tool_call>
-            (ParserState.CONTENT, "FUNC_PREFIX"): Transition(
-                ParserState.TOOL_NAME,
                 (EventType.TOOL_CALL_START,),
             ),
+            # NOTE: No (CONTENT, FUNC_PREFIX) orphan transition — bare
+            # <function= without a preceding <tool_call> stays content.
             (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
                 ParserState.CONTENT,
                 (EventType.TOOL_CALL_END,),
@@ -195,6 +190,7 @@ def qwen3_config(
         stream_arg_deltas=True,
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,
+        validate_tool_names=True,
     )
 
 
@@ -202,8 +198,15 @@ class Qwen3Parser(ParserEngine):
     """Qwen3 parser: ``<think>``/``</think>`` reasoning +
     ``<tool_call>`` XML tool calls in a single engine.
 
-    - ``<tool_call>`` as implicit reasoning end
-    - Unpaired ``<tool_call>`` token ID detection for ``is_reasoning_end``
+    Hardened invariants:
+    - Tool markup inside reasoning is plain text (never ends think,
+      never emits ``tool_calls``).
+    - Reasoning ends only on ``</think>`` (never on unpaired
+      ``<tool_call>``).
+    - Orphan ``<function=`` in content stays ordinary text.
+    - Only complete invokes whose name is in ``request.tools`` emit
+      ``tool_calls``; invalid names flush as content.
+    - ``adjust_request`` bans ``<|endoftext|>`` for the whole turn.
 
     Subclasses that share the grammar but differ only in the four wrapper
     token strings (reasoning + tool-call) override the class attributes
@@ -240,9 +243,6 @@ class Qwen3Parser(ParserEngine):
             tools,
             **kwargs,
         )
-        vocab = self.vocab
-        self._tool_call_token_id: int | None = vocab.get(self.TOOL_START)
-        self._tool_call_end_token_id: int | None = vocab.get(self.TOOL_END)
 
     def extract_reasoning(
         self,
@@ -254,23 +254,22 @@ class Qwen3Parser(ParserEngine):
         return super().extract_reasoning(model_output, request)
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
-        if super().is_reasoning_end(input_ids):
-            return True
-        tool_call_id = self._tool_call_token_id
-        tool_call_end_id = self._tool_call_end_token_id
-        reasoning_start_id = self._reasoning_start_token_id
-        if tool_call_id is not None:
-            for i in range(len(input_ids) - 1, -1, -1):
-                if (
-                    reasoning_start_id is not None
-                    and input_ids[i] == reasoning_start_id
-                ):
-                    return False
-                if input_ids[i] == tool_call_id:
-                    if tool_call_end_id is not None and any(
-                        input_ids[j] == tool_call_end_id
-                        for j in range(i + 1, len(input_ids))
-                    ):
-                        continue
-                    return True
-        return False
+        """Reasoning ends only on ``</think>`` — never on tool_call."""
+        return super().is_reasoning_end(input_ids)
+
+    def adjust_request(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        request = super().adjust_request(request)
+        from vllm.parser.qwen3_phase_stop import apply_endoftext_ban_to_request
+
+        apply_endoftext_ban_to_request(
+            request,
+            self.vocab,
+            think_start=self.THINK_START,
+            think_end=self.THINK_END,
+            tool_start=self.TOOL_START,
+            tool_end=self.TOOL_END,
+            initial_reasoning=self.thinking_enabled,
+        )
+        return request
