@@ -542,9 +542,13 @@ class StreamingParserEngine:
         check = body.lstrip("\n") if body.startswith("\n") else text.lstrip()
         if not check:
             return True
-        # Uppercase starts a real answer. Leading '<' is still think prose
-        # (e.g. <|endoftext|>); real tools arrive as TOOL_START terminals.
+        # Uppercase starts a real answer. Leading '<' is usually still
+        # think prose (e.g. <|endoftext|>). Real tool markup commits the
+        # end; TOOL_START / FUNC_PREFIX terminals normally handle this,
+        # but keep the same rule if those tags arrive as plain text.
         if check[0].isupper():
+            return False
+        if check.startswith("<function=") or check.startswith("<tool_call"):
             return False
         if check[0] == "<":
             return True

@@ -141,6 +141,12 @@ def qwen3_config(
             ParserState.TOOL_PREAMBLE,
             (),
         ),
+        # Some Qwen3.6 turns omit <tool_call> and emit <function=...>
+        # immediately after </think>. Treat that as a confirmed invoke.
+        (ParserState.THINK_END_PENDING, "FUNC_PREFIX"): Transition(
+            ParserState.TOOL_NAME,
+            (EventType.REASONING_END, EventType.TOOL_CALL_START),
+        ),
         # -- Tool call transitions --
         # Enter preamble without TOOL_CALL_START: a bare ``<tool_call>`` in
         # prose (e.g. citing a PR title) must not open a tool slot. Confirm
@@ -259,7 +265,9 @@ class Qwen3Parser(ParserEngine):
     - Structural tags inside markdown `` `...` `` / fenced code are inert
       prose (no reasoning end, no tool emit).
     - Well-formed tools with a known name still emit after answer prose.
-    - Orphan ``<function=`` in content stays ordinary text.
+    - Orphan ``<function=`` in content stays ordinary text, but
+      ``<function=`` immediately after confirmed ``</think>`` still
+      starts a tool (models sometimes omit ``<tool_call>``).
     - Only complete invokes whose name is in ``request.tools`` emit
       ``tool_calls``; invalid names flush as content.
     - ``adjust_request`` bans ``<|endoftext|>`` for the whole turn.

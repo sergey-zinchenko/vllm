@@ -621,6 +621,65 @@ class TestStructuralTagProseInvariants:
         assert len(tool_calls) == 1
         assert tool_calls[0].name == "get_weather"
 
+    def test_think_end_then_orphan_function_still_emits_tool(
+        self, mock_tokenizer, mock_request
+    ):
+        """Qwen3.6 sometimes omits <tool_call> and emits <function=...> only."""
+        from tests.parser.engine.streaming_helpers import (
+            collect_function_name,
+            simulate_tool_streaming,
+        )
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "Brave_Search_brave_web_search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        text = (
+            "Keywords: vLLM qwen3_reasoning_parser PR endoftext.\n"
+            "</think>\n"
+            "\n"
+            "<function=Brave_Search_brave_web_search>\n"
+            "<parameter=query>\n"
+            "vLLM site:github.com/vllm-project/vllm endoftext\n"
+            "</parameter>\n"
+            "</function>\n"
+        )
+        parser = Qwen3Parser(mock_tokenizer, tools=tools)
+        reasoning, content, tool_calls = parser.parse(text, mock_request)
+        assert reasoning is not None
+        assert reasoning.startswith(
+            "Keywords: vLLM qwen3_reasoning_parser PR endoftext."
+        )
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "Brave_Search_brave_web_search"
+        assert "Brave_Search" not in reasoning
+        assert "<function=" not in reasoning
+
+        chunks = [
+            "Keywords: endoftext.\n",
+            "</think>\n\n",
+            "<function=Brave_Search_brave_web_search>\n",
+            "<parameter=query>\n",
+            "vLLM endoftext\n",
+            "</parameter>\n",
+            "</function>\n",
+        ]
+        stream_parser = Qwen3Parser(mock_tokenizer, tools=tools)
+        results = simulate_tool_streaming(stream_parser, mock_request, chunks)
+        assert collect_function_name(results) == "Brave_Search_brave_web_search"
+
     def test_empty_special_decode_still_emits_tag_literal(self, mock_request):
         """tokenizer.decode(special_id) == '' must not drop the tag."""
         vocab = dict(_QWEN3_VOCAB)
