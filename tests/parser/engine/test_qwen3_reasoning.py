@@ -658,6 +658,107 @@ class TestStructuralTagProseInvariants:
         _assert_tag_visible(reasoning, "<tool_call>")
 
 
+class TestMarkdownInertStructuralTags:
+    """Structural tags inside markdown code must not end think or emit tools."""
+
+    @pytest.fixture
+    def parser(self, mock_tokenizer):
+        return Qwen3Parser(mock_tokenizer)
+
+    @pytest.fixture
+    def parser_with_tools(self, mock_tokenizer):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        return Qwen3Parser(mock_tokenizer, tools=tools)
+
+    def test_backticked_think_end_stays_reasoning(self, parser):
+        text = "docs say `</think>` closes think but this is a citation."
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        assert "docs say" in reasoning
+        assert "closes think" in reasoning
+        _assert_tag_visible(reasoning, "</think>")
+
+    def test_backticked_tool_call_pr_title_stays_reasoning(self, parser):
+        text = "PR #35687: Treat `<tool_call>` as implicit reasoning end."
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert "PR #35687" in (reasoning or "")
+        assert "as implicit reasoning end" in (reasoning or "")
+        _assert_tag_visible(reasoning, "<tool_call>")
+
+    def test_fenced_tool_xml_in_think_stays_reasoning(
+        self, parser_with_tools, mock_request
+    ):
+        text = (
+            "Example invoke:\n"
+            "```xml\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "```\n"
+            "Still thinking about it."
+        )
+        reasoning, content, tool_calls = parser_with_tools.parse(text, mock_request)
+        assert content is None or content == ""
+        assert tool_calls is None or tool_calls == []
+        assert reasoning is not None
+        assert "Still thinking about it." in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
+
+    def test_endoftext_slash_tool_call_transcript_stays_reasoning(self, parser):
+        text = (
+            "fixing the <endoftext> / <tool_call> token appearing "
+            "in the reasoning block of Qwen3.6 in vLLM."
+        )
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        assert "fixing the" in reasoning
+        assert "appearing in the reasoning block" in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
+
+    def test_think_end_then_endoftext_prose_stays_reasoning(self, parser):
+        text = "</think><|endoftext|> as a stop token discussion continues."
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        _assert_tag_visible(reasoning, "</think>")
+        assert "discussion continues" in reasoning
+
+    def test_streaming_backticked_think_end(self, parser):
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["docs say `", "</think>", "` closes think."],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+            ],
+        )
+        assert content == ""
+        assert "docs say" in reasoning
+        assert "closes think." in reasoning
+        _assert_tag_visible(reasoning, "</think>")
+
+
 class TestWhitespaceStrippingDisabled:
     """When strip_trailing_reasoning_whitespace is False,
     trailing whitespace in reasoning must be preserved."""

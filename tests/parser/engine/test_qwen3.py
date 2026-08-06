@@ -1266,29 +1266,75 @@ class TestHardenedInvariants:
         assert "<tool_call>" in (result.content or "")
         assert "not_a_real_tool" in (result.content or "")
 
-    def test_markdown_example_with_real_tool_name_stays_content(
+    def test_fenced_example_with_real_tool_name_stays_content(
         self, parser_with_tools, mock_request
     ):
-        """After answer prose, even a valid tool name in a fence is text.
-
-        Regression: docs that embed ``<tool_call><function=get_weather>``
-        were parsed as a real invoke and swallowed until ``</tool_call>``,
-        leaving a dangling ``</function></tool_call>`` at the end.
-        """
+        """Fenced doc example must stay text even with a known tool name."""
         text = (
             "Отлично, полная картина.\n\n"
             "Пример:\n"
+            "```xml\n"
             "<tool_call>\n"
             "<function=get_weather>\n"
             "<parameter=city>Tokyo</parameter>\n"
             "</function>\n"
             "</tool_call>\n"
+            "```\n"
             "\nИтог: обновляйтесь до 0.20.0."
         )
         result = parser_with_tools.extract_tool_calls(text, mock_request)
         assert result.tools_called is False
         assert result.tool_calls == []
-        assert result.content == text
+        assert "<tool_call>" in (result.content or "")
+        assert "get_weather" in (result.content or "")
+        assert "Итог" in (result.content or "")
+
+    def test_real_tool_after_short_content_still_emits(
+        self, parser_with_tools, mock_request
+    ):
+        """Regression: content before a real invoke must not kill tool_calls."""
+        text = (
+            "Usage Statistics\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert "Usage Statistics" in (result.content or "")
+
+    def test_streaming_real_tool_after_content(self, parser_with_tools, mock_request):
+        chunks = [
+            "Usage Statistics\n",
+            "<tool_call>\n",
+            "<function=get_weather>\n",
+            "<parameter=city>Tokyo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser_with_tools, mock_request, chunks)
+        assert collect_function_name(results) == "get_weather"
+        assert "Usage Statistics" in collect_content(results)
+
+    def test_unknown_tool_after_content_flushed_as_content(
+        self, parser_with_tools, mock_request
+    ):
+        text = (
+            "Here is prose.\n"
+            "<tool_call>\n"
+            "<function=unknown_tool>\n"
+            "<parameter=x>1</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert "unknown_tool" in (result.content or "")
 
     def test_tool_before_content_still_works(self, parser_with_tools, mock_request):
         text = (

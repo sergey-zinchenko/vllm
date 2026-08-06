@@ -194,6 +194,10 @@ class StreamingParserEngine:
         # True when TOOL_PREAMBLE was entered from THINK_END_PENDING; real
         # REASONING_END waits for <function=, prose abort returns to reasoning.
         self._reasoning_end_before_tool = False
+        # Markdown code tracking: structural tags inside `...` / ```...```
+        # must stay inert (no REASONING_END / tool transitions).
+        self._md_inline_odd = False
+        self._md_in_fence = False
         self._reset_args_state()
 
     def feed(
@@ -357,6 +361,32 @@ class StreamingParserEngine:
             return value
         return self.config.terminals.get(terminal, "") or ""
 
+    def _in_markdown_code(self) -> bool:
+        return self._md_in_fence or self._md_inline_odd
+
+    def _is_structural_terminal(self, terminal: str) -> bool:
+        lit = self.config.terminals.get(terminal, "")
+        return bool(lit) and "<" in lit
+
+    def _feed_markdown_state(self, text: str) -> None:
+        """Update inline-backtick / fenced-code state from emitted text."""
+        if not text:
+            return
+        i = 0
+        n = len(text)
+        while i < n:
+            if text.startswith("```", i):
+                self._md_in_fence = not self._md_in_fence
+                if self._md_in_fence:
+                    self._md_inline_odd = False
+                i += 3
+                continue
+            if not self._md_in_fence and text[i] == "`":
+                self._md_inline_odd = not self._md_inline_odd
+                i += 1
+                continue
+            i += 1
+
     def _escape_prose_text(self, text: str) -> str:
         """HTML-escape known structural tag literals for UI-safe prose."""
         if not text or not self.config.escape_structural_tags_in_prose:
@@ -382,19 +412,15 @@ class StreamingParserEngine:
         transition = self.config.transitions.get(key)
         text = self._terminal_text(terminal, value)
 
-        if transition is None:
-            if self._has_drops and terminal == DROP_TERMINAL:
-                return []
-            # Absorbed structural tag (e.g. <tool_call> inside REASONING).
+        if self._has_drops and terminal == DROP_TERMINAL and transition is None:
+            return []
+
+        # Inside markdown code: all structural tags are inert prose.
+        if self._in_markdown_code() and self._is_structural_terminal(terminal):
             return self._emit_for_state(text)
 
-        # Markdown / prose after the answer started: do not open tools.
-        if (
-            self.config.forbid_tools_after_content
-            and self._answer_content_started
-            and self.state == ParserState.CONTENT
-            and terminal == "TOOL_START"
-        ):
+        if transition is None:
+            # Absorbed structural tag (e.g. <tool_call> inside REASONING).
             return self._emit_for_state(text)
 
         if self.skip_tool_parsing and terminal in self._tool_terminals:
@@ -457,7 +483,9 @@ class StreamingParserEngine:
             self._think_end_pending_buffer = ""
             self._reasoning_end_before_tool = False
             self.state = ParserState.REASONING
-            text = self._escape_prose_text(f"{marker}{think_ws}{preamble}")
+            raw = f"{marker}{think_ws}{preamble}"
+            self._feed_markdown_state(raw)
+            text = self._escape_prose_text(raw)
             if not text:
                 return []
             return [
@@ -471,6 +499,7 @@ class StreamingParserEngine:
         self.state = ParserState.CONTENT
         if not preamble:
             return []
+        self._feed_markdown_state(preamble)
         self._note_answer_content(preamble)
         return [
             SemanticEvent(
@@ -513,8 +542,12 @@ class StreamingParserEngine:
         check = body.lstrip("\n") if body.startswith("\n") else text.lstrip()
         if not check:
             return True
-        if check[0].isupper() or check[0] == "<":
+        # Uppercase starts a real answer. Leading '<' is still think prose
+        # (e.g. <|endoftext|>); real tools arrive as TOOL_START terminals.
+        if check[0].isupper():
             return False
+        if check[0] == "<":
+            return True
         if check[0] in ",;:)]}'\"`":
             return True
         lower = check.lower()
@@ -535,10 +568,12 @@ class StreamingParserEngine:
 
         if self._is_false_think_end_continuation(text):
             self.state = ParserState.REASONING
+            raw = f"{marker}{buffered}{text}"
+            self._feed_markdown_state(raw)
             return [
                 SemanticEvent(
                     EventType.REASONING_CHUNK,
-                    value=self._escape_prose_text(f"{marker}{buffered}{text}"),
+                    value=self._escape_prose_text(raw),
                     tool_index=self.tool_index,
                 )
             ]
@@ -549,6 +584,7 @@ class StreamingParserEngine:
         ]
         content = f"{buffered}{text}"
         if content:
+            self._feed_markdown_state(content)
             self._note_answer_content(content)
             events.append(
                 SemanticEvent(
@@ -584,6 +620,8 @@ class StreamingParserEngine:
             ]
         content_type = self.config.content_events.get(self.state)
         if content_type is not None:
+            if content_type in (EventType.REASONING_CHUNK, EventType.TEXT_CHUNK):
+                self._feed_markdown_state(text)
             if content_type == EventType.REASONING_CHUNK:
                 text = self._escape_prose_text(text)
             if (
