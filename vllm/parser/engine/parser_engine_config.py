@@ -103,6 +103,11 @@ class ParserEngineConfig:
     # ending reasoning. Mid-sentence continuations treat the tag as prose.
     defer_reasoning_end: bool = False
 
+    # When True, after non-whitespace answer content has been emitted, bare
+    # ``<tool_call>`` is kept as text (markdown examples / citations) instead
+    # of opening a tool. Tools must appear before the answer prose.
+    forbid_tools_after_content: bool = False
+
     @cached_property
     def terminal_defs(self):
         from vllm.parser.engine.incremental_lexer import terminals_from_literals

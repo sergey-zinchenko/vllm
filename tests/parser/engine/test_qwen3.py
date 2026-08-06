@@ -1266,6 +1266,44 @@ class TestHardenedInvariants:
         assert "<tool_call>" in (result.content or "")
         assert "not_a_real_tool" in (result.content or "")
 
+    def test_markdown_example_with_real_tool_name_stays_content(
+        self, parser_with_tools, mock_request
+    ):
+        """After answer prose, even a valid tool name in a fence is text.
+
+        Regression: docs that embed ``<tool_call><function=get_weather>``
+        were parsed as a real invoke and swallowed until ``</tool_call>``,
+        leaving a dangling ``</function></tool_call>`` at the end.
+        """
+        text = (
+            "Отлично, полная картина.\n\n"
+            "Пример:\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "\nИтог: обновляйтесь до 0.20.0."
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_tool_before_content_still_works(self, parser_with_tools, mock_request):
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>\n"
+            "The weather looks fine."
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is True
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert "weather looks fine" in (result.content or "")
+
     def test_invalid_tool_name_flushed_as_content(
         self, parser_with_tools, mock_request
     ):

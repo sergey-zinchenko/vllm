@@ -232,6 +232,7 @@ def qwen3_config(
         tool_args_json=False,
         validate_tool_names=validate_tool_names,
         defer_reasoning_end=True,
+        forbid_tools_after_content=True,
         # Keep discussed stop markers as visible text instead of silent DROP.
         preserve_tokens=frozenset({QWEN_IM_END, QWEN_END_OF_TEXT}),
     )
@@ -248,6 +249,8 @@ class Qwen3Parser(ParserEngine):
       ``<tool_call>``). A mid-sentence ``</think>`` mention stays reasoning.
     - Bare ``<tool_call>`` in content is not a tool until
       ``<function=`` follows; otherwise it streams as text (citations).
+    - After answer prose has started, ``<tool_call>`` stays text (markdown
+      examples must not open a tool and swallow the rest of the message).
     - Orphan ``<function=`` in content stays ordinary text.
     - Only complete invokes whose name is in ``request.tools`` emit
       ``tool_calls``; invalid names flush as content.

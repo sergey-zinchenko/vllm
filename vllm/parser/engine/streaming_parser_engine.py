@@ -190,6 +190,7 @@ class StreamingParserEngine:
         self._tool_preamble_buffer = ""
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
+        self._answer_content_started = False
         self._reset_args_state()
 
     def feed(
@@ -355,6 +356,15 @@ class StreamingParserEngine:
                 return []
             return self._emit_for_state(value)
 
+        # Markdown / prose after the answer started: do not open tools.
+        if (
+            self.config.forbid_tools_after_content
+            and self._answer_content_started
+            and self.state == ParserState.CONTENT
+            and terminal == "TOOL_START"
+        ):
+            return self._emit_for_state(value)
+
         if self.skip_tool_parsing and terminal in self._tool_terminals:
             if self.state == ParserState.MESSAGE_HEADER:
                 self.state = ParserState.CONTENT
@@ -392,6 +402,10 @@ class StreamingParserEngine:
 
         return self._apply_transition(transition, value)
 
+    def _note_answer_content(self, text: str) -> None:
+        if text.strip():
+            self._answer_content_started = True
+
     def _flush_tool_preamble_as_content(self, extra: str = "") -> list[SemanticEvent]:
         """Abort an unconfirmed tool preamble back to ordinary content.
 
@@ -409,6 +423,7 @@ class StreamingParserEngine:
         self.state = ParserState.CONTENT
         if not text:
             return []
+        self._note_answer_content(text)
         return [
             SemanticEvent(
                 EventType.TEXT_CHUNK,
@@ -486,6 +501,7 @@ class StreamingParserEngine:
         ]
         content = f"{buffered}{text}"
         if content:
+            self._note_answer_content(content)
             events.append(
                 SemanticEvent(
                     EventType.TEXT_CHUNK,
@@ -520,6 +536,11 @@ class StreamingParserEngine:
             ]
         content_type = self.config.content_events.get(self.state)
         if content_type is not None:
+            if (
+                content_type == EventType.TEXT_CHUNK
+                and self.state == ParserState.CONTENT
+            ):
+                self._note_answer_content(text)
             return [SemanticEvent(content_type, value=text, tool_index=self.tool_index)]
         return []
 
@@ -604,6 +625,7 @@ class StreamingParserEngine:
             self._tool_preamble_buffer = ""
             self.state = ParserState.CONTENT
             if text:
+                self._note_answer_content(text)
                 return [
                     SemanticEvent(
                         EventType.TEXT_CHUNK,
