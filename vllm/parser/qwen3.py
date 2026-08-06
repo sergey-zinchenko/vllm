@@ -126,17 +126,21 @@ def qwen3_config(
             (),
         ),
         # -- Tool call transitions --
+        # Enter preamble without TOOL_CALL_START: a bare ``<tool_call>`` in
+        # prose (e.g. citing a PR title) must not open a tool slot. Confirm
+        # only when ``<function=`` follows; otherwise the streaming engine
+        # aborts preamble back to content.
         (ParserState.CONTENT, "TOOL_START"): Transition(
             ParserState.TOOL_PREAMBLE,
-            (EventType.TOOL_CALL_START,),
+            (),
         ),
         (ParserState.TOOL_PREAMBLE, "TOOL_END"): Transition(
             ParserState.CONTENT,
-            (EventType.TOOL_CALL_END,),
+            (),
         ),
         (ParserState.TOOL_PREAMBLE, "FUNC_PREFIX"): Transition(
             ParserState.TOOL_NAME,
-            (),
+            (EventType.TOOL_CALL_START,),
         ),
         (ParserState.TOOL_NAME, "CLOSE_ANGLE"): Transition(
             ParserState.TOOL_ARGS,
@@ -166,7 +170,7 @@ def qwen3_config(
         # Consecutive tool call without closing </tool_call>
         (ParserState.TOOL_BETWEEN, "TOOL_START"): Transition(
             ParserState.TOOL_PREAMBLE,
-            (EventType.TOOL_CALL_START,),
+            (),
         ),
         (ParserState.TOOL_BETWEEN, "FUNC_PREFIX"): Transition(
             ParserState.TOOL_NAME,
@@ -175,9 +179,10 @@ def qwen3_config(
     }
     if tool_call_ends_reasoning:
         # Legacy: <tool_call> from REASONING implicitly ends think.
+        # TOOL_CALL_START still waits for <function= (same as content).
         transitions[(ParserState.REASONING, "TOOL_START")] = Transition(
             ParserState.TOOL_PREAMBLE,
-            (EventType.REASONING_END, EventType.TOOL_CALL_START),
+            (EventType.REASONING_END,),
         )
     if orphan_func_prefix:
         transitions[(ParserState.CONTENT, "FUNC_PREFIX")] = Transition(
@@ -225,6 +230,8 @@ class Qwen3Parser(ParserEngine):
       never emits ``tool_calls``).
     - Reasoning ends only on ``</think>`` (never on unpaired
       ``<tool_call>``).
+    - Bare ``<tool_call>`` in content is not a tool until
+      ``<function=`` follows; otherwise it streams as text (citations).
     - Orphan ``<function=`` in content stays ordinary text.
     - Only complete invokes whose name is in ``request.tools`` emit
       ``tool_calls``; invalid names flush as content.

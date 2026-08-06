@@ -1217,6 +1217,36 @@ class TestHardenedInvariants:
         assert result.tool_calls == []
         assert "<function=get_weather>" in (result.content or "")
 
+    def test_cited_tool_call_tag_in_prose_stays_content(
+        self, parser_with_tools, mock_request
+    ):
+        """PR-title citations must not open a tool / swallow the rest."""
+        text = (
+            "PR #35687 — Treat <tool_call> as implicit reasoning end in Qwen3 parser."
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert result.content == text
+
+    def test_streaming_cited_tool_call_never_goes_silent(
+        self, parser_with_tools, mock_request
+    ):
+        """After a prose <tool_call>, subsequent tokens must keep streaming."""
+        chunks = [
+            "PR #35687 — Treat ",
+            "<tool_call>",
+            " as implicit reasoning end in Qwen3 parser.",
+        ]
+        results = simulate_tool_streaming(parser_with_tools, mock_request, chunks)
+        content = collect_content(results)
+        assert "<tool_call>" in content
+        assert "as implicit reasoning end" in content
+        assert "Qwen3 parser." in content
+        for delta, _ in results:
+            if delta and delta.tool_calls:
+                raise AssertionError(f"unexpected tool_calls: {delta.tool_calls}")
+
     def test_markdown_fenced_lookalike_stays_content(
         self, parser_with_tools, mock_request
     ):

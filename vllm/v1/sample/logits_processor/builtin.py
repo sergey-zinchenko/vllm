@@ -289,9 +289,11 @@ class MinTokensLogitsProcessor(LogitsProcessor):
 class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
     """Phase-aware ``<|im_end|>`` ban for Qwen3 hardened serving.
 
-    While accepted output is still in REASONING or an open TOOL region,
-    ``im_end`` logits are set to ``-inf``. Works with speculative decoding
-    via :meth:`apply_with_spec_decode` (same pattern as min-tokens).
+    While accepted output is still in REASONING, ``im_end`` logits are set
+    to ``-inf``. Open tool markup does not ban stop (prose citations of
+    ``<tool_call>`` must remain stoppable). Works with speculative
+    decoding via :meth:`apply_with_spec_decode` (same pattern as
+    min-tokens).
     """
 
     def __init__(

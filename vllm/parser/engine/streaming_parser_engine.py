@@ -186,6 +186,8 @@ class StreamingParserEngine:
         self._scanner.reset()
         self._lexer.reset()
         self._message_header_buffer = ""
+        self._tool_preamble_open = ""
+        self._tool_preamble_buffer = ""
         self._reset_args_state()
 
     def feed(
@@ -251,8 +253,25 @@ class StreamingParserEngine:
             self._args_buffer = ""
             self._args_safe_end = 0
 
-        if self.state in (
-            ParserState.TOOL_PREAMBLE,
+        if self.state == ParserState.TOOL_PREAMBLE:
+            if self.tool_index >= 0:
+                # Legacy configs emit TOOL_CALL_START on ``<tool_call>``;
+                # finalize the open slot. Hardened Qwen3 confirms later.
+                events.append(
+                    SemanticEvent(
+                        EventType.TOOL_CALL_END,
+                        tool_index=self.tool_index,
+                    )
+                )
+                self._tool_preamble_open = ""
+                self._tool_preamble_buffer = ""
+                self.state = ParserState.CONTENT
+            else:
+                # Unconfirmed ``<tool_call>`` (no ``<function=``) → content.
+                # Never leave the stream silent: dropped preamble text is what
+                # makes clients appear "hung" while the GPU keeps decoding.
+                events.extend(self._flush_tool_preamble_as_content())
+        elif self.state in (
             ParserState.TOOL_ARGS,
             ParserState.TOOL_NAME,
             ParserState.TOOL_BETWEEN,
@@ -355,10 +374,42 @@ class StreamingParserEngine:
 
         return self._apply_transition(transition, value)
 
+    def _flush_tool_preamble_as_content(self, extra: str = "") -> list[SemanticEvent]:
+        """Abort an unconfirmed tool preamble back to ordinary content.
+
+        ``TOOL_PREAMBLE`` has no ``content_events`` entry, so plain text used
+        to be dropped silently — e.g. citing ``Treat <tool_call> as ...`` in
+        the answer phase. Reconstruct the opening tag + buffered whitespace
+        + *extra* and return to ``CONTENT``.
+        """
+        open_tag = self._tool_preamble_open or self.config.terminals.get(
+            "TOOL_START", ""
+        )
+        text = f"{open_tag}{self._tool_preamble_buffer}{extra}"
+        self._tool_preamble_open = ""
+        self._tool_preamble_buffer = ""
+        self.state = ParserState.CONTENT
+        if not text:
+            return []
+        return [
+            SemanticEvent(
+                EventType.TEXT_CHUNK,
+                value=text,
+                tool_index=self.tool_index,
+            )
+        ]
+
     def _emit_for_state(self, text: str) -> list[SemanticEvent]:
         if self.state == ParserState.MESSAGE_HEADER:
             self._message_header_buffer += text
             return []
+        if self.state == ParserState.TOOL_PREAMBLE:
+            # Real tools allow whitespace between ``<tool_call>`` and
+            # ``<function=``. Anything else means this was prose.
+            if not text.strip():
+                self._tool_preamble_buffer += text
+                return []
+            return self._flush_tool_preamble_as_content(text)
         if self.state == ParserState.TOOL_ARGS:
             if self.config.tool_args_json:
                 return self._feed_args_text(text)
@@ -405,6 +456,47 @@ class StreamingParserEngine:
         if previous_state == ParserState.MESSAGE_HEADER:
             message_header = self._message_header_buffer
             self._message_header_buffer = ""
+
+        # Remember the opening tag when entering an unconfirmed preamble.
+        if (
+            transition.next_state == ParserState.TOOL_PREAMBLE
+            and previous_state != ParserState.TOOL_PREAMBLE
+        ):
+            self._tool_preamble_open = value
+            self._tool_preamble_buffer = ""
+
+        # Empty ``<tool_call></tool_call>`` (no ``<function=``): surface as
+        # content instead of a tool slot / silent drop.
+        if (
+            previous_state == ParserState.TOOL_PREAMBLE
+            and transition.next_state == ParserState.CONTENT
+            and EventType.TOOL_CALL_START not in transition.events
+            and self.tool_index < 0
+        ):
+            open_tag = self._tool_preamble_open or self.config.terminals.get(
+                "TOOL_START", ""
+            )
+            text = f"{open_tag}{self._tool_preamble_buffer}{value}"
+            self._tool_preamble_open = ""
+            self._tool_preamble_buffer = ""
+            self.state = ParserState.CONTENT
+            if text:
+                return [
+                    SemanticEvent(
+                        EventType.TEXT_CHUNK,
+                        value=text,
+                        tool_index=self.tool_index,
+                    )
+                ]
+            return []
+
+        # Confirmed invoke: drop preamble whitespace (markup only).
+        if (
+            previous_state == ParserState.TOOL_PREAMBLE
+            and transition.next_state != ParserState.TOOL_PREAMBLE
+        ):
+            self._tool_preamble_open = ""
+            self._tool_preamble_buffer = ""
 
         self.state = transition.next_state
 

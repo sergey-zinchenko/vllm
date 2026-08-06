@@ -6,7 +6,13 @@ Product invariants:
 1. ``<|endoftext|>`` is always banned for chat/tool serving (turn ends via
    ``im_end`` / max_tokens / tool end).
 2. ``<|im_end|>`` is phase-aware: banned while the accepted output is still
-   in REASONING or an open TOOL region; allowed in CONTENT outside tools.
+   in REASONING; allowed once ``</think>`` has closed think.
+
+Open ``<tool_call>`` regions intentionally do **not** ban ``im_end``.
+Models often cite ``<tool_call>`` as prose in the answer phase without a
+matching ``</tool_call>``; treating that as an open tool made stop
+impossible (GPU keeps decoding, client stream looks hung). Incomplete
+real tool calls are finalized by the parser ``finish()`` path instead.
 
 These helpers intentionally avoid ``logit_bias`` (rejected by
 ``SamplingParams._validate_spec_decode`` under MTP). Endoftext is banned
@@ -147,11 +153,14 @@ def is_in_reasoning_or_tool_phase(
 ) -> bool:
     """Heuristic phase detection from accepted output token ids.
 
-    Returns ``True`` when ``im_end`` must be banned (still inside think, or
-    inside an unclosed ``<tool_call>`` region).
+    Returns ``True`` when ``im_end`` must be banned (still inside think).
+
+    ``tool_start_id`` / ``tool_end_id`` are accepted for config compatibility
+    but do not affect the ban: unpaired ``<tool_call>`` in prose must not
+    block stop tokens.
     """
+    del tool_start_id, tool_end_id
     in_reasoning = initial_reasoning
-    tool_depth = 0
 
     for tid in output_token_ids:
         if think_start_id is not None and tid == think_start_id:
@@ -160,19 +169,8 @@ def is_in_reasoning_or_tool_phase(
         if think_end_id is not None and tid == think_end_id:
             in_reasoning = False
             continue
-        if tool_start_id is not None and tid == tool_start_id:
-            # Tool calls only open in the answer phase; still track depth
-            # so nested/accidental tags inside params don't end the ban
-            # early when the outer tool_call is unclosed.
-            if not in_reasoning:
-                tool_depth += 1
-            continue
-        if tool_end_id is not None and tid == tool_end_id:
-            if tool_depth > 0:
-                tool_depth -= 1
-            continue
 
-    return in_reasoning or tool_depth > 0
+    return in_reasoning
 
 
 def phase_banned_token_ids(

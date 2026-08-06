@@ -54,8 +54,10 @@ class TestPhaseDetection:
             initial_reasoning=True,
         )
 
-    def test_open_tool_region_bans_im_end(self):
-        assert is_in_reasoning_or_tool_phase(
+    def test_open_tool_markup_does_not_ban_im_end(self):
+        # Prose citations of <tool_call> without </tool_call> must remain
+        # stoppable — otherwise decoding never ends (GPU hang / silent stream).
+        assert not is_in_reasoning_or_tool_phase(
             [_THINK_END, _TOOL_START, 5],
             think_start_id=_THINK_START,
             think_end_id=_THINK_END,
