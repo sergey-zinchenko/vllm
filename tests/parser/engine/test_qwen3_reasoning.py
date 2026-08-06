@@ -936,6 +936,53 @@ class TestMarkdownInertStructuralTags:
         assert "closes think." in reasoning
         _assert_tag_visible(reasoning, "</think>")
 
+    def test_dangling_backtick_before_think_end_still_emits_tool(
+        self, parser_with_tools, mock_request
+    ):
+        """Stray unclosed `` ` `` before newline must not swallow </think>/tools."""
+        text = (
+            "The user is asking about PRs that fix the Qwen3.6 `\n"
+            "</think>\n"
+            "\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        reasoning, content, tool_calls = parser_with_tools.parse(text, mock_request)
+        assert reasoning is not None
+        assert "Qwen3.6" in reasoning
+        assert "<tool_call>" not in reasoning
+        assert "<function=" not in reasoning
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "get_weather"
+        assert content is None or "<function=" not in content
+
+    def test_streaming_dangling_backtick_then_tool(
+        self, parser_with_tools, mock_request
+    ):
+        from tests.parser.engine.streaming_helpers import (
+            collect_content,
+            collect_function_name,
+            simulate_tool_streaming,
+        )
+
+        chunks = [
+            "Asking about Qwen3.6 `",
+            "\n",
+            "</think>\n\n",
+            "<tool_call>\n",
+            "<function=get_weather>\n",
+            "<parameter=city>Tokyo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser_with_tools, mock_request, chunks)
+        assert collect_function_name(results) == "get_weather"
+        assert "<function=" not in collect_content(results)
+
 
 class TestWhitespaceStrippingDisabled:
     """When strip_trailing_reasoning_whitespace is False,

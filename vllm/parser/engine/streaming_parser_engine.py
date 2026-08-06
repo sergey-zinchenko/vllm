@@ -382,7 +382,12 @@ class StreamingParserEngine:
         return bool(lit) and "<" in lit
 
     def _feed_markdown_state(self, text: str) -> None:
-        """Update inline-backtick / fenced-code state from emitted text."""
+        """Update inline-backtick / fenced-code state from emitted text.
+
+        Inline spans do not survive newlines: a dangling `` ` `` must not
+        keep suppressing ``</think>`` / tool terminals on the next line.
+        Fenced ``` blocks are unchanged.
+        """
         if not text:
             return
         i = 0
@@ -396,6 +401,10 @@ class StreamingParserEngine:
                 continue
             if not self._md_in_fence and text[i] == "`":
                 self._md_inline_odd = not self._md_inline_odd
+                i += 1
+                continue
+            if not self._md_in_fence and self._md_inline_odd and text[i] == "\n":
+                self._md_inline_odd = False
                 i += 1
                 continue
             i += 1
