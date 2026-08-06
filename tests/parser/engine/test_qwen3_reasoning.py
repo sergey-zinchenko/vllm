@@ -1021,3 +1021,95 @@ class TestThinkingDisabled:
         reasoning, content = p.extract_reasoning("The answer is 42.", None)
         assert reasoning is None
         assert content == "The answer is 42."
+
+
+class TestDelegatingParserNoToolContentLeak:
+    """Serving uses DelegatingParser adapters; tools must not also appear as
+    visible content (the 'duplicate tool XML in the answer' bug)."""
+
+    def test_orphan_tools_after_think_not_in_content(self, mock_tokenizer):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "Brave_Search_brave_web_search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            ),
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "Brave_Search_brave_llm_context",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "maximum_number_of_tokens": {"type": "integer"},
+                            "maximum_number_of_urls": {"type": "integer"},
+                        },
+                    },
+                },
+            ),
+        ]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            tool_choice="auto",
+            include_reasoning=True,
+        )
+        parser = _Qwen3DelegatingParser(mock_tokenizer, tools=tools)
+        # Stream in coarse chunks (think / each tool) like the serving path.
+        chunks = [
+            "thinking about search.\n</think>\n\n",
+            (
+                "<function=Brave_Search_brave_web_search>\n"
+                "<parameter=query>\n"
+                "vllm qwen3 endoftext\n"
+                "</parameter>\n"
+                "</function>\n"
+            ),
+            (
+                "<function=Brave_Search_brave_llm_context>\n"
+                "<parameter=maximum_number_of_tokens>\n"
+                "32000\n"
+                "</parameter>\n"
+                "<parameter=query>\n"
+                "vllm PR #35687\n"
+                "</parameter>\n"
+                "</function>\n"
+            ),
+        ]
+        content_parts: list[str] = []
+        tool_names: list[str] = []
+        for i, chunk in enumerate(chunks):
+            delta = parser.parse_delta(
+                chunk,
+                [],
+                request,
+                prompt_token_ids=[1, 2, 3],
+                finished=(i == len(chunks) - 1),
+            )
+            if delta is None:
+                continue
+            if delta.content:
+                content_parts.append(delta.content)
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.function and tc.function.name:
+                        tool_names.append(tc.function.name)
+
+        content = "".join(content_parts)
+        assert "Brave_Search_brave_web_search" in tool_names
+        assert "Brave_Search_brave_llm_context" in tool_names
+        assert "<function=" not in content
+        assert "<parameter=" not in content
+        assert "</function>" not in content

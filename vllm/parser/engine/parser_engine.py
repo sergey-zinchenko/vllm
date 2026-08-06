@@ -402,6 +402,25 @@ class ParserEngine(Parser):
     def _accept_tool_name(self, name: str) -> bool:
         return bool(name) and self._is_valid_tool_name(name)
 
+    def _looks_like_real_tool_args(self, args: str) -> bool:
+        """Whether *args* look like a real invoke body, not prose after a tag.
+
+        Qwen XML tools use ``<parameter=...>``. Empty bodies are valid
+        no-arg calls. Mid-sentence citations like
+        ``Use <function=get_weather> in docs`` must not become tool_calls.
+        """
+        if self.parser_engine_config.tool_args_json:
+            return True
+        if "<parameter=" in args or "<parameter =" in args:
+            return True
+        return not args.strip()
+
+    def _should_emit_tool_name(self, slot: ToolCallSlot) -> bool:
+        """Delay name deltas for XML tools until the invoke looks real."""
+        if self.parser_engine_config.tool_args_json:
+            return True
+        return self._looks_like_real_tool_args(slot.args or "")
+
     # ── Private helpers ─────────────────────────────────────────────
 
     def _check_skip_tool_parsing(
@@ -756,7 +775,9 @@ class ParserEngine(Parser):
         if len(tool_call_deltas) > 1:
             tool_call_deltas = self._coalesce_tool_call_deltas(tool_call_deltas)
 
-        if self._deferred_content and (not seen_tool_event or not tool_call_deltas):
+        if self._deferred_content and (
+            finished or not seen_tool_event or not tool_call_deltas
+        ):
             content_parts.insert(0, self._deferred_content)
             self._deferred_content = ""
 
@@ -846,12 +867,13 @@ class ParserEngine(Parser):
             slot.append_args(event.value)
 
         if not slot.name_sent:
-            if slot.name:
+            if slot.name and self._should_emit_tool_name(slot):
                 self._emit_name_delta(idx, deltas, slot.name)
             elif event.value:
                 # Name not yet known — try to extract from accumulated args
                 name = self._try_extract_name(idx)
-                self._emit_name_delta(idx, deltas, name)
+                if name and self._should_emit_tool_name(slot):
+                    self._emit_name_delta(idx, deltas, name)
         elif event.value:
             # Name already sent — emit arg delta
             arg_delta = self._compute_arg_delta(idx, event.value)
@@ -872,6 +894,9 @@ class ParserEngine(Parser):
         func_end = terminals.get("FUNC_END", "</function>")
         name = slot.name or ""
         args = slot.args or ""
+        # Prose / orphan rejects must not invent <tool_call> wrappers.
+        if not self._looks_like_real_tool_args(args):
+            return f"{func_prefix}{name}>{args}"
         return f"{tool_start}\n{func_prefix}{name}>{args}{func_end}\n{tool_end}"
 
     def _handle_tool_end(
@@ -888,7 +913,9 @@ class ParserEngine(Parser):
 
         if not slot.name_sent:
             name = slot.name or self._try_extract_name(idx) or ""
-            if self._accept_tool_name(name):
+            if self._accept_tool_name(name) and self._looks_like_real_tool_args(
+                slot.args or ""
+            ):
                 slot.name = name
                 slot.name_sent = True
                 slot.string_keys = self._streamable_string_keys(
@@ -908,7 +935,7 @@ class ParserEngine(Parser):
                 )
                 remaining = None
             elif self.parser_engine_config.validate_tool_names:
-                # Invalid / missing name → flush entire span as content
+                # Invalid / missing name, or prose lookalike → content
                 # (Qwen3 hardened invariant). Other parsers keep prior
                 # silent-drop behavior when validate_tool_names is off.
                 slot.name = name
@@ -1072,7 +1099,9 @@ class ParserEngine(Parser):
             else:
                 args_json = "{}"
 
-            if self._accept_tool_name(name):
+            if self._accept_tool_name(name) and self._looks_like_real_tool_args(
+                raw_body
+            ):
                 self._ensure_tool_id(slot, name)
                 args_json = self._fix_arg_types(args_json, name)
                 tool_calls.append(

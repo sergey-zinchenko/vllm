@@ -1211,11 +1211,29 @@ class TestHardenedInvariants:
         )
 
     def test_orphan_function_prefix_stays_content(self, parser, mock_request):
+        """Mid-sentence citation without <parameter= must not become a tool."""
         text = "Use <function=get_weather> in docs; not a real invoke."
         result = parser.extract_tool_calls(text, mock_request)
         assert result.tools_called is False
         assert result.tool_calls == []
         assert "<function=get_weather>" in (result.content or "")
+        assert "in docs" in (result.content or "")
+
+    def test_orphan_function_with_parameters_emits_tool(
+        self, parser_with_tools, mock_request
+    ):
+        """Models often omit <tool_call>; known <function=...> must still emit."""
+        text = (
+            "Usage Statistics\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+        )
+        result = parser_with_tools.extract_tool_calls(text, mock_request)
+        assert result.tools_called is True
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert "Usage Statistics" in (result.content or "")
+        assert "<function=" not in (result.content or "")
 
     def test_cited_tool_call_tag_in_prose_stays_content(
         self, parser_with_tools, mock_request

@@ -198,6 +198,8 @@ class StreamingParserEngine:
         # must stay inert (no REASONING_END / tool transitions).
         self._md_inline_odd = False
         self._md_in_fence = False
+        # Open <parameter=...> depth inside TOOL_ARGS (nested </tool_call>).
+        self._param_depth = 0
         self._reset_args_state()
 
     def feed(
@@ -468,6 +470,19 @@ class StreamingParserEngine:
 
         if transition.skip_in_token_id_mode and self._ever_had_token_ids:
             return self._emit_for_state(text)
+
+        # Nested </tool_call> inside an open <parameter=...> is argument text.
+        if (
+            self.state == ParserState.TOOL_ARGS
+            and terminal == "TOOL_END"
+            and self._param_depth > 0
+        ):
+            return self._emit_for_state(text)
+
+        if self.state == ParserState.TOOL_ARGS and terminal == "PARAM_START":
+            self._param_depth += 1
+        elif self.state == ParserState.TOOL_ARGS and terminal == "PARAM_END":
+            self._param_depth = max(0, self._param_depth - 1)
 
         return self._apply_transition(transition, text)
 
@@ -762,6 +777,12 @@ class StreamingParserEngine:
             self._think_end_marker = ""
             self._think_end_pending_buffer = ""
             self._reasoning_end_before_tool = False
+
+        if (
+            previous_state == ParserState.TOOL_ARGS
+            and transition.next_state != ParserState.TOOL_ARGS
+        ):
+            self._param_depth = 0
 
         self.state = transition.next_state
 

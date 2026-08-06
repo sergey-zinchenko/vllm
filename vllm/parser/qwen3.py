@@ -96,7 +96,7 @@ def qwen3_config(
     tool_start: str = TOOL_CALL_START,
     tool_end: str = TOOL_CALL_END,
     tool_call_ends_reasoning: bool = False,
-    orphan_func_prefix: bool = False,
+    orphan_func_prefix: bool = True,
     validate_tool_names: bool = True,
 ) -> ParserEngineConfig:
     """Build the Qwen3-family parser config.
@@ -106,8 +106,9 @@ def qwen3_config(
         tool_call_ends_reasoning: Legacy behavior — bare ``<tool_call>``
             ends think and starts a tool (Nemotron V3). Hardened Qwen3
             keeps this False so markup inside think is plain text.
-        orphan_func_prefix: Legacy — bare ``<function=`` in CONTENT starts
-            a tool. Hardened Qwen3 keeps this False.
+        orphan_func_prefix: Bare ``<function=`` in CONTENT starts a tool.
+            Prose citations without ``<parameter=`` are rejected back to
+            text when ``validate_tool_names`` is on.
         validate_tool_names: Reject tool names absent from ``request.tools``.
     """
     transitions: dict[tuple[ParserState, str], Transition] = {
@@ -176,6 +177,19 @@ def qwen3_config(
         (ParserState.TOOL_ARGS, "FUNC_END"): Transition(
             ParserState.TOOL_BETWEEN,
             (EventType.TOOL_CALL_END,),
+        ),
+        # Close tool on </tool_call> even when </function> was omitted.
+        # Streaming engine keeps nested </tool_call> inside <parameter=...>
+        # as argument text via parameter-depth tracking.
+        (ParserState.TOOL_ARGS, "TOOL_END"): Transition(
+            ParserState.CONTENT,
+            (EventType.TOOL_CALL_END,),
+        ),
+        # Next orphan <function=...> while still in args (previous tool
+        # omitted </parameter></function></tool_call>).
+        (ParserState.TOOL_ARGS, "FUNC_PREFIX"): Transition(
+            ParserState.TOOL_NAME,
+            (EventType.TOOL_CALL_END, EventType.TOOL_CALL_START),
         ),
         (ParserState.TOOL_ARGS, "PARAM_START"): Transition(
             ParserState.TOOL_ARGS,
@@ -265,9 +279,9 @@ class Qwen3Parser(ParserEngine):
     - Structural tags inside markdown `` `...` `` / fenced code are inert
       prose (no reasoning end, no tool emit).
     - Well-formed tools with a known name still emit after answer prose.
-    - Orphan ``<function=`` in content stays ordinary text, but
-      ``<function=`` immediately after confirmed ``</think>`` still
-      starts a tool (models sometimes omit ``<tool_call>``).
+    - Orphan ``<function=`` may start a tool (models often omit
+      ``<tool_call>``), including right after ``</think>``. Prose
+      citations without ``<parameter=`` flush back to content.
     - Only complete invokes whose name is in ``request.tools`` emit
       ``tool_calls``; invalid names flush as content.
     - ``adjust_request`` bans ``<|endoftext|>`` for the whole turn.
