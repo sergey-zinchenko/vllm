@@ -188,6 +188,8 @@ class StreamingParserEngine:
         self._message_header_buffer = ""
         self._tool_preamble_open = ""
         self._tool_preamble_buffer = ""
+        self._think_end_marker = ""
+        self._think_end_pending_buffer = ""
         self._reset_args_state()
 
     def feed(
@@ -283,6 +285,22 @@ class StreamingParserEngine:
                         tool_index=self.tool_index,
                     )
                 )
+            self.state = ParserState.CONTENT
+        elif self.state == ParserState.THINK_END_PENDING:
+            # Stream ended after </think> — commit the deferred end.
+            events.append(
+                SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index)
+            )
+            if self._think_end_pending_buffer:
+                events.append(
+                    SemanticEvent(
+                        EventType.TEXT_CHUNK,
+                        value=self._think_end_pending_buffer,
+                        tool_index=self.tool_index,
+                    )
+                )
+            self._think_end_marker = ""
+            self._think_end_pending_buffer = ""
             self.state = ParserState.CONTENT
         elif self.state == ParserState.REASONING:
             events.append(
@@ -399,10 +417,90 @@ class StreamingParserEngine:
             )
         ]
 
+    # Mid-sentence glue after a mentioned ``</think>`` (not a new answer).
+    _FALSE_THINK_END_PREFIXES = (
+        "or ",
+        "or,",
+        "or.",
+        "or\n",
+        "and ",
+        "as ",
+        "to ",
+        "that ",
+        "which ",
+        "with ",
+        "by ",
+        "from ",
+        "of ",
+        "in ",
+        "on ",
+        "for ",
+    )
+
+    @classmethod
+    def _is_false_think_end_continuation(cls, text: str) -> bool:
+        """Whether text after ``</think>`` looks like mid-sentence prose.
+
+        Continuations like `` or …`` mean the tag was *mentioned* inside
+        reasoning. Ordinary answers (including lowercase) commit the end.
+        """
+        if not text.strip():
+            return True
+        body = text.lstrip(" \t\r")
+        check = body.lstrip("\n") if body.startswith("\n") else text.lstrip()
+        if not check:
+            return True
+        if check[0].isupper() or check[0] == "<":
+            return False
+        if check[0] in ",;:)]}'\"`":
+            return True
+        lower = check.lower()
+        if lower == "or" or lower == "as" or lower == "and":
+            return True
+        return any(lower.startswith(p) for p in cls._FALSE_THINK_END_PREFIXES)
+
+    def _resolve_think_end_pending(self, text: str) -> list[SemanticEvent]:
+        """Commit or abort a deferred ``</think>`` using following text."""
+        if not text.strip():
+            self._think_end_pending_buffer += text
+            return []
+
+        marker = self._think_end_marker or self.config.terminals.get("THINK_END", "")
+        buffered = self._think_end_pending_buffer
+        self._think_end_marker = ""
+        self._think_end_pending_buffer = ""
+
+        if self._is_false_think_end_continuation(text):
+            self.state = ParserState.REASONING
+            return [
+                SemanticEvent(
+                    EventType.REASONING_CHUNK,
+                    value=f"{marker}{buffered}{text}",
+                    tool_index=self.tool_index,
+                )
+            ]
+
+        self.state = ParserState.CONTENT
+        events = [
+            SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index),
+        ]
+        content = f"{buffered}{text}"
+        if content:
+            events.append(
+                SemanticEvent(
+                    EventType.TEXT_CHUNK,
+                    value=content,
+                    tool_index=self.tool_index,
+                )
+            )
+        return events
+
     def _emit_for_state(self, text: str) -> list[SemanticEvent]:
         if self.state == ParserState.MESSAGE_HEADER:
             self._message_header_buffer += text
             return []
+        if self.state == ParserState.THINK_END_PENDING:
+            return self._resolve_think_end_pending(text)
         if self.state == ParserState.TOOL_PREAMBLE:
             # Real tools allow whitespace between ``<tool_call>`` and
             # ``<function=``. Anything else means this was prose.
@@ -464,6 +562,31 @@ class StreamingParserEngine:
         ):
             self._tool_preamble_open = value
             self._tool_preamble_buffer = ""
+
+        # Enter deferred </think> hold.
+        if (
+            transition.next_state == ParserState.THINK_END_PENDING
+            and previous_state == ParserState.REASONING
+        ):
+            self._think_end_marker = value
+            self._think_end_pending_buffer = ""
+
+        # Extra </think> while still deciding — keep as literal text.
+        if (
+            previous_state == ParserState.THINK_END_PENDING
+            and transition.next_state == ParserState.THINK_END_PENDING
+        ):
+            self._think_end_pending_buffer += value
+            self.state = ParserState.THINK_END_PENDING
+            return []
+
+        # Confirmed end via following tool call — drop held whitespace.
+        if (
+            previous_state == ParserState.THINK_END_PENDING
+            and EventType.REASONING_END in transition.events
+        ):
+            self._think_end_marker = ""
+            self._think_end_pending_buffer = ""
 
         # Empty ``<tool_call></tool_call>`` (no ``<function=``): surface as
         # content instead of a tool slot / silent drop.

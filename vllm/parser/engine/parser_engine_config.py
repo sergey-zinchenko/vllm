@@ -28,6 +28,9 @@ from vllm.parser.engine.events import EventType
 class ParserState(Enum):
     CONTENT = auto()
     REASONING = auto()
+    # After ``</think>`` but before we know if it was a real end or a
+    # prose mention (e.g. discussing the tag). See ``defer_reasoning_end``.
+    THINK_END_PENDING = auto()
     MESSAGE_HEADER = auto()
     TOOL_PREAMBLE = auto()
     TOOL_NAME = auto()
@@ -95,6 +98,10 @@ class ParserEngineConfig:
 
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
+
+    # When True, ``</think>`` enters THINK_END_PENDING instead of immediately
+    # ending reasoning. Mid-sentence continuations treat the tag as prose.
+    defer_reasoning_end: bool = False
 
     @cached_property
     def terminal_defs(self):

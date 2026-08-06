@@ -29,6 +29,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
+from vllm.parser.qwen3_phase_stop import QWEN_END_OF_TEXT, QWEN_IM_END
 
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -115,15 +116,27 @@ def qwen3_config(
             ParserState.REASONING,
             (),
         ),
+        # Defer REASONING_END: models often *mention* ``</think>`` while
+        # still thinking (e.g. discussing special tokens). Confirm via
+        # streaming engine lookahead (THINK_END_PENDING).
         (ParserState.REASONING, "THINK_END"): Transition(
-            ParserState.CONTENT,
-            (EventType.REASONING_END,),
+            ParserState.THINK_END_PENDING,
+            (),
         ),
         # Absorb duplicate </think> — model may emit it after
         # already transitioning to CONTENT; drop it silently.
         (ParserState.CONTENT, "THINK_END"): Transition(
             ParserState.CONTENT,
             (),
+        ),
+        (ParserState.THINK_END_PENDING, "THINK_END"): Transition(
+            ParserState.THINK_END_PENDING,
+            (),
+        ),
+        # Real end confirmed by a following tool invoke.
+        (ParserState.THINK_END_PENDING, "TOOL_START"): Transition(
+            ParserState.TOOL_PREAMBLE,
+            (EventType.REASONING_END,),
         ),
         # -- Tool call transitions --
         # Enter preamble without TOOL_CALL_START: a bare ``<tool_call>`` in
@@ -218,6 +231,9 @@ def qwen3_config(
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,
         validate_tool_names=validate_tool_names,
+        defer_reasoning_end=True,
+        # Keep discussed stop markers as visible text instead of silent DROP.
+        preserve_tokens=frozenset({QWEN_IM_END, QWEN_END_OF_TEXT}),
     )
 
 
@@ -228,8 +244,8 @@ class Qwen3Parser(ParserEngine):
     Hardened invariants:
     - Tool markup inside reasoning is plain text (never ends think,
       never emits ``tool_calls``).
-    - Reasoning ends only on ``</think>`` (never on unpaired
-      ``<tool_call>``).
+    - Reasoning ends only on confirmed ``</think>`` (never on unpaired
+      ``<tool_call>``). A mid-sentence ``</think>`` mention stays reasoning.
     - Bare ``<tool_call>`` in content is not a tool until
       ``<function=`` follows; otherwise it streams as text (citations).
     - Orphan ``<function=`` in content stays ordinary text.

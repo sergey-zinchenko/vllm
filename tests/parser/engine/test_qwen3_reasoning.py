@@ -5,9 +5,9 @@
 Validates that ``Qwen3Parser`` correctly handles
 ``<think>``/``</think>`` reasoning with Qwen3 hardened invariants:
 - Tool markup inside think stays reasoning text (never implicit end)
-- Reasoning ends only on ``</think>``
+- Reasoning ends only on confirmed ``</think>`` (not mid-sentence mentions)
 - Stripping ``<think>`` from generated output (old template compat)
-- No ``</think>`` terminal text leaks into output
+- No confirmed ``</think>`` terminal text leaks into output
 """
 
 import dataclasses
@@ -275,6 +275,43 @@ class TestStreaming:
         assert "I need to check." in reasoning
         assert "<tool_call>" in reasoning
         assert content == ""
+
+    def test_mentioned_think_end_stays_reasoning(self, parser):
+        """Discussing </think> mid-sentence must not open the answer phase.
+
+        Regression: model prose like ``treating </think> or … as special
+        tokens`` was split into reason/response at the mentioned tag.
+        """
+        text = (
+            "Another potential issue is the tokenizer treating "
+            "</think> or <|im_end|> as special tokens that trigger "
+            "stops incorrectly."
+        )
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        assert "tokenizer treating" in reasoning
+        assert "as special tokens that trigger" in reasoning
+        assert "</think>" in reasoning
+
+    def test_streaming_mentioned_think_end_stays_reasoning(self, parser):
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "tokenizer treating ",
+                "</think>",
+                " or <|im_end|> as special tokens that trigger stops.",
+            ],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+            ],
+        )
+        assert content == ""
+        assert "tokenizer treating" in reasoning
+        assert "</think>" in reasoning
+        assert "as special tokens that trigger stops." in reasoning
 
     def test_streaming_content_after_think_end(self, parser):
         """Content deltas after </think> are routed as content."""
