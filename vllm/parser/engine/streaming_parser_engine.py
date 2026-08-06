@@ -544,32 +544,13 @@ class StreamingParserEngine:
             )
         ]
 
-    # Mid-sentence glue after a mentioned ``</think>`` (not a new answer).
-    _FALSE_THINK_END_PREFIXES = (
-        "or ",
-        "or,",
-        "or.",
-        "or\n",
-        "and ",
-        "as ",
-        "to ",
-        "that ",
-        "which ",
-        "with ",
-        "by ",
-        "from ",
-        "of ",
-        "in ",
-        "on ",
-        "for ",
-    )
-
     @classmethod
     def _is_false_think_end_continuation(cls, text: str) -> bool:
         """Whether text after ``</think>`` looks like mid-sentence prose.
 
-        Continuations like `` or …`` mean the tag was *mentioned* inside
-        reasoning. Ordinary answers (including lowercase) commit the end.
+        Real answers commit the end when they start with an Uppercase letter
+        (or tool markup). Lowercase / punctuation / ``<|…|>`` prose means
+        the tag was *mentioned* inside reasoning — stay in think.
         """
         if not text.strip():
             return True
@@ -589,10 +570,8 @@ class StreamingParserEngine:
             return True
         if check[0] in ",;:)]}'\"`":
             return True
-        lower = check.lower()
-        if lower == "or" or lower == "as" or lower == "and":
-            return True
-        return any(lower.startswith(p) for p in cls._FALSE_THINK_END_PREFIXES)
+        # Lowercase (and any other non-answer start) continues reasoning.
+        return True
 
     def _resolve_think_end_pending(self, text: str) -> list[SemanticEvent]:
         """Commit or abort a deferred ``</think>`` using following text."""

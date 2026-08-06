@@ -234,7 +234,7 @@ class TestStreaming:
     def test_basic_streaming(self, parser):
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["<think>", "thinking", " hard", "</think>", "done"],
+            ["<think>", "thinking", " hard", "</think>", "Done"],
             [
                 (_THINK_START_ID,),
                 (1,),
@@ -244,13 +244,13 @@ class TestStreaming:
             ],
         )
         assert reasoning == "thinking hard"
-        assert content == "done"
+        assert content == "Done"
 
     def test_streaming_no_start_token(self, parser):
         """Qwen3.5 style: no <think> in output, just reasoning then </think>."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["reasoning ", "text", "</think>", "content"],
+            ["reasoning ", "text", "</think>", "Content"],
             [
                 (1,),
                 (2,),
@@ -259,13 +259,13 @@ class TestStreaming:
             ],
         )
         assert reasoning == "reasoning text"
-        assert content == "content"
+        assert content == "Content"
 
     def test_streaming_start_token_stripped(self, parser):
         """<think> in output (old template) should be stripped."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["<think>reasoning", "</think>", "content"],
+            ["<think>reasoning", "</think>", "Content"],
             [
                 (_THINK_START_ID, 1),
                 (_THINK_END_ID,),
@@ -273,7 +273,7 @@ class TestStreaming:
             ],
         )
         assert reasoning == "reasoning"
-        assert content == "content"
+        assert content == "Content"
 
     def test_streaming_tool_call_stays_in_reasoning(self, parser):
         """<tool_call> inside think streams as reasoning, not content."""
@@ -309,6 +309,29 @@ class TestStreaming:
         _assert_tag_visible(reasoning, "</think>")
         assert "<|im_end|>" in reasoning
 
+    def test_think_end_then_lowercase_closing_stays_reasoning(self, parser):
+        """Screenshot: lowercase prose after </think> is still thinking."""
+        text = (
+            "Otherwise (thinking enabled, default), a missing\n"
+            "</think>\n"
+            "closing `</think>` is usually treated as truncated reasoning."
+        )
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        assert "a missing" in reasoning
+        assert "closing" in reasoning
+        assert "truncated reasoning" in reasoning
+        _assert_tag_visible(reasoning, "</think>")
+
+    def test_think_end_then_is_usually_stays_reasoning(self, parser):
+        text = "text </think> is usually treated as truncated."
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        assert "is usually treated" in reasoning
+        _assert_tag_visible(reasoning, "</think>")
+
     def test_streaming_mentioned_think_end_stays_reasoning(self, parser):
         reasoning, content = simulate_reasoning_streaming(
             parser,
@@ -333,7 +356,7 @@ class TestStreaming:
         """Content deltas after </think> are routed as content."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["reasoning", "</think>", "content1", " content2"],
+            ["reasoning", "</think>", "Content1", " content2"],
             [
                 (1,),
                 (_THINK_END_ID,),
@@ -342,7 +365,7 @@ class TestStreaming:
             ],
         )
         assert reasoning == "reasoning"
-        assert content == "content1 content2"
+        assert content == "Content1 content2"
 
     def test_streaming_tool_markup_after_think_end_is_content(self, parser):
         """After </think>, tool markup is handled by the tool FSM (content)."""
@@ -363,14 +386,14 @@ class TestStreaming:
         """</think> grouped with following content in one delta."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["reasoning", "</think>the answer"],
+            ["reasoning", "</think>The answer"],
             [
                 (1,),
                 (_THINK_END_ID, 2),
             ],
         )
         assert reasoning == "reasoning"
-        assert content == "the answer"
+        assert content == "The answer"
 
     def test_streaming_think_and_end_in_one_delta(self, parser):
         """<think> and </think> in the same delta."""
@@ -428,7 +451,7 @@ class TestStreaming:
         """Terminal text must never appear in reasoning or content."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["reasoning", "</think>", "content"],
+            ["reasoning", "</think>", "Content"],
             [
                 (1,),
                 (_THINK_END_ID,),
@@ -443,7 +466,7 @@ class TestStreaming:
         """Duplicate </think> token in CONTENT state must not leak."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["reasoning", "</think>", "content", "</think>", "more"],
+            ["reasoning", "</think>", "Content", "</think>", "More"],
             [
                 (1,),
                 (_THINK_END_ID,),
@@ -453,7 +476,7 @@ class TestStreaming:
             ],
         )
         assert reasoning == "reasoning"
-        assert content == "contentmore"
+        assert content == "ContentMore"
 
 
 class TestTrailingWhitespaceStripping:
@@ -499,7 +522,7 @@ class TestTrailingWhitespaceStripping:
     def test_streaming_trailing_newline_stripped(self, parser_with_strip):
         reasoning, content = simulate_reasoning_streaming(
             parser_with_strip,
-            ["thinking.\n", "</think>", "done"],
+            ["thinking.\n", "</think>", "Done"],
             [
                 (1,),
                 (_THINK_END_ID,),
@@ -507,12 +530,12 @@ class TestTrailingWhitespaceStripping:
             ],
         )
         assert reasoning == "thinking."
-        assert content == "done"
+        assert content == "Done"
 
     def test_streaming_multiple_trailing_newlines_stripped(self, parser_with_strip):
         reasoning, content = simulate_reasoning_streaming(
             parser_with_strip,
-            ["thinking.\n", "\n", "\n", "</think>", "done"],
+            ["thinking.\n", "\n", "\n", "</think>", "Done"],
             [
                 (1,),
                 (2,),
@@ -522,7 +545,7 @@ class TestTrailingWhitespaceStripping:
             ],
         )
         assert reasoning == "thinking."
-        assert content == "done"
+        assert content == "Done"
 
     def test_streaming_internal_newlines_preserved(self, parser_with_strip):
         reasoning, content = simulate_reasoning_streaming(
@@ -1005,7 +1028,7 @@ class TestWhitespaceStrippingDisabled:
     def test_streaming_preserves_trailing_newlines(self, parser_no_strip):
         reasoning, content = simulate_reasoning_streaming(
             parser_no_strip,
-            ["thinking.\n", "\n", "</think>", "done"],
+            ["thinking.\n", "\n", "</think>", "Done"],
             [
                 (1,),
                 (2,),
@@ -1014,7 +1037,7 @@ class TestWhitespaceStrippingDisabled:
             ],
         )
         assert reasoning == "thinking.\n\n"
-        assert content == "done"
+        assert content == "Done"
 
 
 class TestThinkingDisabled:
