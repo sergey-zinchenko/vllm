@@ -191,6 +191,9 @@ class StreamingParserEngine:
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
         self._answer_content_started = False
+        # True when TOOL_PREAMBLE was entered from THINK_END_PENDING; real
+        # REASONING_END waits for <function=, prose abort returns to reasoning.
+        self._reasoning_end_before_tool = False
         self._reset_args_state()
 
     def feed(
@@ -268,12 +271,13 @@ class StreamingParserEngine:
                 )
                 self._tool_preamble_open = ""
                 self._tool_preamble_buffer = ""
+                self._reasoning_end_before_tool = False
                 self.state = ParserState.CONTENT
             else:
-                # Unconfirmed ``<tool_call>`` (no ``<function=``) → content.
+                # Unconfirmed ``<tool_call>`` (no ``<function=``) → text.
                 # Never leave the stream silent: dropped preamble text is what
                 # makes clients appear "hung" while the GPU keeps decoding.
-                events.extend(self._flush_tool_preamble_as_content())
+                events.extend(self._flush_tool_preamble_as_text())
         elif self.state in (
             ParserState.TOOL_ARGS,
             ParserState.TOOL_NAME,
@@ -347,14 +351,42 @@ class StreamingParserEngine:
         }
     )
 
+    def _terminal_text(self, terminal: str, value: str) -> str:
+        """Prefer *value*, else the configured literal (empty decode-safe)."""
+        if value:
+            return value
+        return self.config.terminals.get(terminal, "") or ""
+
+    def _escape_prose_text(self, text: str) -> str:
+        """HTML-escape known structural tag literals for UI-safe prose."""
+        if not text or not self.config.escape_structural_tags_in_prose:
+            return text
+        # Only tag-like literals (must contain ``<``). Skip bare ``>`` /
+        # other punctuation terminals so prose like ``<|im_end|>`` is intact
+        # except for known structural tags.
+        literals = sorted(
+            (lit for lit in self.config.terminals.values() if lit and "<" in lit),
+            key=len,
+            reverse=True,
+        )
+        for lit in literals:
+            if lit in text:
+                escaped = (
+                    lit.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                )
+                text = text.replace(lit, escaped)
+        return text
+
     def _on_terminal(self, terminal: str, value: str) -> list[SemanticEvent]:
         key = (self.state, terminal)
         transition = self.config.transitions.get(key)
+        text = self._terminal_text(terminal, value)
 
         if transition is None:
             if self._has_drops and terminal == DROP_TERMINAL:
                 return []
-            return self._emit_for_state(value)
+            # Absorbed structural tag (e.g. <tool_call> inside REASONING).
+            return self._emit_for_state(text)
 
         # Markdown / prose after the answer started: do not open tools.
         if (
@@ -363,7 +395,7 @@ class StreamingParserEngine:
             and self.state == ParserState.CONTENT
             and terminal == "TOOL_START"
         ):
-            return self._emit_for_state(value)
+            return self._emit_for_state(text)
 
         if self.skip_tool_parsing and terminal in self._tool_terminals:
             if self.state == ParserState.MESSAGE_HEADER:
@@ -398,36 +430,52 @@ class StreamingParserEngine:
             return []
 
         if transition.skip_in_token_id_mode and self._ever_had_token_ids:
-            return self._emit_for_state(value)
+            return self._emit_for_state(text)
 
-        return self._apply_transition(transition, value)
+        return self._apply_transition(transition, text)
 
     def _note_answer_content(self, text: str) -> None:
         if text.strip():
             self._answer_content_started = True
 
-    def _flush_tool_preamble_as_content(self, extra: str = "") -> list[SemanticEvent]:
-        """Abort an unconfirmed tool preamble back to ordinary content.
+    def _flush_tool_preamble_as_text(self, extra: str = "") -> list[SemanticEvent]:
+        """Abort an unconfirmed tool preamble back to ordinary text.
 
-        ``TOOL_PREAMBLE`` has no ``content_events`` entry, so plain text used
-        to be dropped silently — e.g. citing ``Treat <tool_call> as ...`` in
-        the answer phase. Reconstruct the opening tag + buffered whitespace
-        + *extra* and return to ``CONTENT``.
+        If preamble followed a deferred ``</think>`` (reasoning still open),
+        reconstruct ``</think>`` + ``<tool_call>`` + prose as reasoning.
+        Otherwise emit as content (answer-phase citations).
         """
-        open_tag = self._tool_preamble_open or self.config.terminals.get(
-            "TOOL_START", ""
-        )
-        text = f"{open_tag}{self._tool_preamble_buffer}{extra}"
+        open_tag = self._terminal_text("TOOL_START", self._tool_preamble_open)
+        preamble = f"{open_tag}{self._tool_preamble_buffer}{extra}"
         self._tool_preamble_open = ""
         self._tool_preamble_buffer = ""
+
+        if self._reasoning_end_before_tool or self._think_end_marker:
+            marker = self._terminal_text("THINK_END", self._think_end_marker)
+            think_ws = self._think_end_pending_buffer
+            self._think_end_marker = ""
+            self._think_end_pending_buffer = ""
+            self._reasoning_end_before_tool = False
+            self.state = ParserState.REASONING
+            text = self._escape_prose_text(f"{marker}{think_ws}{preamble}")
+            if not text:
+                return []
+            return [
+                SemanticEvent(
+                    EventType.REASONING_CHUNK,
+                    value=text,
+                    tool_index=self.tool_index,
+                )
+            ]
+
         self.state = ParserState.CONTENT
-        if not text:
+        if not preamble:
             return []
-        self._note_answer_content(text)
+        self._note_answer_content(preamble)
         return [
             SemanticEvent(
                 EventType.TEXT_CHUNK,
-                value=text,
+                value=preamble,
                 tool_index=self.tool_index,
             )
         ]
@@ -480,7 +528,7 @@ class StreamingParserEngine:
             self._think_end_pending_buffer += text
             return []
 
-        marker = self._think_end_marker or self.config.terminals.get("THINK_END", "")
+        marker = self._terminal_text("THINK_END", self._think_end_marker)
         buffered = self._think_end_pending_buffer
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
@@ -490,7 +538,7 @@ class StreamingParserEngine:
             return [
                 SemanticEvent(
                     EventType.REASONING_CHUNK,
-                    value=f"{marker}{buffered}{text}",
+                    value=self._escape_prose_text(f"{marker}{buffered}{text}"),
                     tool_index=self.tool_index,
                 )
             ]
@@ -523,7 +571,7 @@ class StreamingParserEngine:
             if not text.strip():
                 self._tool_preamble_buffer += text
                 return []
-            return self._flush_tool_preamble_as_content(text)
+            return self._flush_tool_preamble_as_text(text)
         if self.state == ParserState.TOOL_ARGS:
             if self.config.tool_args_json:
                 return self._feed_args_text(text)
@@ -536,6 +584,8 @@ class StreamingParserEngine:
             ]
         content_type = self.config.content_events.get(self.state)
         if content_type is not None:
+            if content_type == EventType.REASONING_CHUNK:
+                text = self._escape_prose_text(text)
             if (
                 content_type == EventType.TEXT_CHUNK
                 and self.state == ParserState.CONTENT
@@ -581,15 +631,19 @@ class StreamingParserEngine:
             transition.next_state == ParserState.TOOL_PREAMBLE
             and previous_state != ParserState.TOOL_PREAMBLE
         ):
-            self._tool_preamble_open = value
+            self._tool_preamble_open = self._terminal_text("TOOL_START", value)
             self._tool_preamble_buffer = ""
+            if previous_state == ParserState.THINK_END_PENDING:
+                # Keep </think> marker; confirm REASONING_END only on
+                # <function= (real tool after think).
+                self._reasoning_end_before_tool = True
 
         # Enter deferred </think> hold.
         if (
             transition.next_state == ParserState.THINK_END_PENDING
             and previous_state == ParserState.REASONING
         ):
-            self._think_end_marker = value
+            self._think_end_marker = self._terminal_text("THINK_END", value)
             self._think_end_pending_buffer = ""
 
         # Extra </think> while still deciding — keep as literal text.
@@ -597,51 +651,55 @@ class StreamingParserEngine:
             previous_state == ParserState.THINK_END_PENDING
             and transition.next_state == ParserState.THINK_END_PENDING
         ):
-            self._think_end_pending_buffer += value
+            self._think_end_pending_buffer += self._terminal_text("THINK_END", value)
             self.state = ParserState.THINK_END_PENDING
             return []
 
-        # Confirmed end via following tool call — drop held whitespace.
-        if (
-            previous_state == ParserState.THINK_END_PENDING
-            and EventType.REASONING_END in transition.events
-        ):
-            self._think_end_marker = ""
-            self._think_end_pending_buffer = ""
-
         # Empty ``<tool_call></tool_call>`` (no ``<function=``): surface as
-        # content instead of a tool slot / silent drop.
+        # text instead of a tool slot / silent drop.
         if (
             previous_state == ParserState.TOOL_PREAMBLE
             and transition.next_state == ParserState.CONTENT
             and EventType.TOOL_CALL_START not in transition.events
             and self.tool_index < 0
         ):
-            open_tag = self._tool_preamble_open or self.config.terminals.get(
-                "TOOL_START", ""
+            return self._flush_tool_preamble_as_text(
+                self._terminal_text("TOOL_END", value)
             )
-            text = f"{open_tag}{self._tool_preamble_buffer}{value}"
-            self._tool_preamble_open = ""
-            self._tool_preamble_buffer = ""
-            self.state = ParserState.CONTENT
-            if text:
-                self._note_answer_content(text)
-                return [
+
+        # Confirmed invoke from preamble: emit deferred REASONING_END first.
+        if (
+            previous_state == ParserState.TOOL_PREAMBLE
+            and transition.next_state != ParserState.TOOL_PREAMBLE
+            and EventType.TOOL_CALL_START in transition.events
+        ):
+            if self._reasoning_end_before_tool:
+                events.append(
                     SemanticEvent(
-                        EventType.TEXT_CHUNK,
-                        value=text,
+                        EventType.REASONING_END,
                         tool_index=self.tool_index,
                     )
-                ]
-            return []
-
-        # Confirmed invoke: drop preamble whitespace (markup only).
-        if (
+                )
+                self._reasoning_end_before_tool = False
+                self._think_end_marker = ""
+                self._think_end_pending_buffer = ""
+            self._tool_preamble_open = ""
+            self._tool_preamble_buffer = ""
+        elif (
             previous_state == ParserState.TOOL_PREAMBLE
             and transition.next_state != ParserState.TOOL_PREAMBLE
         ):
             self._tool_preamble_open = ""
             self._tool_preamble_buffer = ""
+
+        # Legacy: REASONING_END on the same transition that leaves pending.
+        if (
+            previous_state == ParserState.THINK_END_PENDING
+            and EventType.REASONING_END in transition.events
+        ):
+            self._think_end_marker = ""
+            self._think_end_pending_buffer = ""
+            self._reasoning_end_before_tool = False
 
         self.state = transition.next_state
 

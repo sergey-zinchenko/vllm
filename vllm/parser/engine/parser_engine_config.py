@@ -108,6 +108,11 @@ class ParserEngineConfig:
     # of opening a tool. Tools must appear before the answer prose.
     forbid_tools_after_content: bool = False
 
+    # HTML-escape known structural tag literals when emitting them as prose
+    # (reasoning absorb / false think-end / post-content tool text) so UIs
+    # do not render empty HTML widgets for raw ``<tool_call>`` etc.
+    escape_structural_tags_in_prose: bool = False
+
     @cached_property
     def terminal_defs(self):
         from vllm.parser.engine.incremental_lexer import terminals_from_literals

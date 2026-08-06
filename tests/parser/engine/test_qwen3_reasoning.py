@@ -38,6 +38,19 @@ _QWEN3_VOCAB = {
 }
 
 
+def _esc_tag(tag: str) -> str:
+    """HTML-escaped form emitted for structural tags in reasoning prose."""
+    return tag.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _assert_tag_visible(text: str | None, tag: str) -> None:
+    """Tag must appear as raw or HTML-escaped prose (never silently dropped)."""
+    assert text is not None
+    assert tag in text or _esc_tag(tag) in text, (
+        f"expected {tag!r} (or escaped) in {text!r}"
+    )
+
+
 class _Qwen3DelegatingParser(DelegatingParser):
     reasoning_parser_cls = Qwen3ParserReasoningAdapter
     tool_parser_cls = Qwen3ParserToolAdapter
@@ -99,8 +112,9 @@ class TestNonStreaming:
         )
         reasoning, content = parser.extract_reasoning(text, None)
         assert reasoning is not None
-        assert "<tool_call>" in reasoning
-        assert "<function=bash>" in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
+        _assert_tag_visible(reasoning, "<function=")
+        assert "bash" in reasoning
         assert content is None
         assert not parser.is_reasoning_end([_THINK_START_ID, 1, _TOOL_CALL_ID])
 
@@ -114,7 +128,7 @@ class TestNonStreaming:
         )
         reasoning, content = parser.extract_reasoning(text, None)
         assert reasoning is not None
-        assert "<tool_call>" in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
         assert content is None
 
     def test_live_scenario_think_end_before_tool_call(self, parser):
@@ -273,7 +287,7 @@ class TestStreaming:
             ],
         )
         assert "I need to check." in reasoning
-        assert "<tool_call>" in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
         assert content == ""
 
     def test_mentioned_think_end_stays_reasoning(self, parser):
@@ -292,7 +306,8 @@ class TestStreaming:
         assert reasoning is not None
         assert "tokenizer treating" in reasoning
         assert "as special tokens that trigger" in reasoning
-        assert "</think>" in reasoning
+        _assert_tag_visible(reasoning, "</think>")
+        assert "<|im_end|>" in reasoning
 
     def test_streaming_mentioned_think_end_stays_reasoning(self, parser):
         reasoning, content = simulate_reasoning_streaming(
@@ -310,8 +325,9 @@ class TestStreaming:
         )
         assert content == ""
         assert "tokenizer treating" in reasoning
-        assert "</think>" in reasoning
+        _assert_tag_visible(reasoning, "</think>")
         assert "as special tokens that trigger stops." in reasoning
+        assert "<|im_end|>" in reasoning
 
     def test_streaming_content_after_think_end(self, parser):
         """Content deltas after </think> are routed as content."""
@@ -536,8 +552,110 @@ class TestTrailingWhitespaceStripping:
             ],
         )
         assert "I'll check." in reasoning
-        assert "<tool_call>" in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
         assert content == ""
+
+
+class TestStructuralTagProseInvariants:
+    """PR-title / citation tags must stay visible text; tools must not fire."""
+
+    @pytest.fixture
+    def parser(self, mock_tokenizer):
+        return Qwen3Parser(mock_tokenizer)
+
+    @pytest.fixture
+    def parser_with_tools(self, mock_tokenizer):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        return Qwen3Parser(mock_tokenizer, tools=tools)
+
+    def test_pr35687_title_tag_stays_in_reasoning(self, parser):
+        text = "PR #35687: Treat <tool_call> as implicit reasoning end in Qwen3 parser."
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        assert "PR #35687" in reasoning
+        assert "as implicit reasoning end" in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
+
+    def test_think_end_then_tool_call_prose_stays_reasoning(self, parser):
+        text = (
+            "Models may omit </think> or emit <tool_call> as a citation "
+            "inside the think block."
+        )
+        reasoning, content = parser.extract_reasoning(text, None)
+        assert content is None or content == ""
+        assert reasoning is not None
+        _assert_tag_visible(reasoning, "</think>")
+        _assert_tag_visible(reasoning, "<tool_call>")
+        assert "inside the think block" in reasoning
+
+    def test_real_think_end_then_tool_still_works(
+        self, parser_with_tools, mock_request
+    ):
+        text = (
+            "Done thinking.</think>\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        reasoning, content, tool_calls = parser_with_tools.parse(text, mock_request)
+        assert reasoning == "Done thinking."
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "get_weather"
+
+    def test_empty_special_decode_still_emits_tag_literal(self, mock_request):
+        """tokenizer.decode(special_id) == '' must not drop the tag."""
+        vocab = dict(_QWEN3_VOCAB)
+        id_to_text = {v: k for k, v in vocab.items()}
+
+        tokenizer = make_mock_tokenizer(vocab)
+
+        def _decode(ids):
+            parts = []
+            for i in ids:
+                if i in (_THINK_END_ID, _TOOL_CALL_ID):
+                    parts.append("")  # empty special decode
+                else:
+                    parts.append(id_to_text.get(i, chr(i) if i < 128 else f"<{i}>"))
+            return "".join(parts)
+
+        tokenizer.decode.side_effect = _decode
+        parser = Qwen3Parser(tokenizer)
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "Treat ",
+                "<tool_call>",
+                " as implicit.",
+            ],
+            [
+                (1,),
+                (_TOOL_CALL_ID,),
+                (2,),
+            ],
+        )
+        assert content == ""
+        assert "Treat " in reasoning
+        assert "as implicit." in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
 
 
 class TestWhitespaceStrippingDisabled:

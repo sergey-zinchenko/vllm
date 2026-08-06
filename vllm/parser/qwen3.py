@@ -133,10 +133,13 @@ def qwen3_config(
             ParserState.THINK_END_PENDING,
             (),
         ),
-        # Real end confirmed by a following tool invoke.
+        # Bare <tool_call> after deferred </think> is not yet a real end —
+        # confirm only when <function= follows (streaming engine). Prose
+        # citations (e.g. PR titles) abort back into reasoning with both
+        # tags kept as literal text.
         (ParserState.THINK_END_PENDING, "TOOL_START"): Transition(
             ParserState.TOOL_PREAMBLE,
-            (EventType.REASONING_END,),
+            (),
         ),
         # -- Tool call transitions --
         # Enter preamble without TOOL_CALL_START: a bare ``<tool_call>`` in
@@ -233,6 +236,7 @@ def qwen3_config(
         validate_tool_names=validate_tool_names,
         defer_reasoning_end=True,
         forbid_tools_after_content=True,
+        escape_structural_tags_in_prose=True,
         # Keep discussed stop markers as visible text instead of silent DROP.
         preserve_tokens=frozenset({QWEN_IM_END, QWEN_END_OF_TEXT}),
     )
@@ -246,7 +250,8 @@ class Qwen3Parser(ParserEngine):
     - Tool markup inside reasoning is plain text (never ends think,
       never emits ``tool_calls``).
     - Reasoning ends only on confirmed ``</think>`` (never on unpaired
-      ``<tool_call>``). A mid-sentence ``</think>`` mention stays reasoning.
+      ``<tool_call>``). Mid-sentence ``</think>`` / ``<tool_call>``
+      mentions stay full reasoning text (no holes, no tool emit).
     - Bare ``<tool_call>`` in content is not a tool until
       ``<function=`` follows; otherwise it streams as text (citations).
     - After answer prose has started, ``<tool_call>`` stays text (markdown
