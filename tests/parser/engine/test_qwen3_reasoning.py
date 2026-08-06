@@ -621,6 +621,125 @@ class TestStructuralTagProseInvariants:
         assert len(tool_calls) == 1
         assert tool_calls[0].name == "get_weather"
 
+    def test_think_end_and_tool_in_same_delta_still_emits(
+        self, mock_tokenizer, mock_request
+    ):
+        """``</think>`` special-id delta that also carries plaintext tool XML.
+
+        Detokenizer often flushes ``…</think>\\n\\n<tool_call>…`` in one
+        chunk with only the think-end token id. The scanner must keep the
+        suffix after ``</think>`` so the tool still parses.
+        """
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "Brave_Search_brave_web_search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        mock_request.tools = tools
+        parser = Qwen3Parser(mock_tokenizer, tools=tools)
+        # One detokenizer flush: special-id ``</think>`` plus plaintext tool XML.
+        chunks: list[tuple[str, list[int]]] = [
+            ("thinking done", [1]),
+            (
+                "</think>\n\n"
+                "<tool_call>\n"
+                "<function=Brave_Search_brave_web_search>\n"
+                "<parameter=query>\nq\n</parameter>\n"
+                "</function>\n"
+                "</tool_call>",
+                [_THINK_END_ID],
+            ),
+        ]
+        names: list[str] = []
+        for text, ids in chunks:
+            delta = parser.parse_delta(text, ids, mock_request, finished=False)
+            if delta and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.function and tc.function.name:
+                        names.append(tc.function.name)
+        flush = parser.parse_delta("", [], mock_request, finished=True)
+        if flush and flush.tool_calls:
+            for tc in flush.tool_calls:
+                if tc.function and tc.function.name:
+                    names.append(tc.function.name)
+        assert "Brave_Search_brave_web_search" in names
+
+    def test_think_end_special_then_plaintext_tool_call_still_emits(
+        self, mock_tokenizer, mock_request
+    ):
+        """Regression: ``</think>`` as special token + ``<tool_call>`` as
+        ordinary text must still emit tools (not dump XML into content).
+
+        Qwen often tokenizes think-end as a dedicated id but emits tool
+        tags as multi-token text. Strict token-id demotion used to treat
+        that text ``<tool_call>`` as prose and leak the invoke.
+        """
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "Brave_Search_brave_web_search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        # (text, delta_token_ids) — think-end uses special ids; tool tags do not.
+        chunks: list[tuple[str, list[int]]] = [
+            ("Handle malformed (e.g., unclosed ", [1]),
+            ("</think>", [_THINK_END_ID]),
+            (", <|endoftext|> leaking). Let me search.\n", [2]),
+            ("</think>\n\n", [_THINK_END_ID]),
+            ("<tool_call>\n", []),
+            ("<function=Brave_Search_brave_web_search>\n", []),
+            ("<parameter=query>\nvLLM endoftext\n</parameter>\n", []),
+            ("</function>\n", []),
+            ("</tool_call>", []),
+        ]
+        mock_request.tools = tools
+        parser = Qwen3Parser(mock_tokenizer, tools=tools)
+        names: list[str] = []
+        content_parts: list[str] = []
+        for text, ids in chunks:
+            delta = parser.parse_delta(text, ids, mock_request, finished=False)
+            if delta is None:
+                continue
+            if delta.content:
+                content_parts.append(delta.content)
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.function and tc.function.name:
+                        names.append(tc.function.name)
+        flush = parser.parse_delta("", [], mock_request, finished=True)
+        if flush and flush.tool_calls:
+            for tc in flush.tool_calls:
+                if tc.function and tc.function.name:
+                    names.append(tc.function.name)
+        if flush and flush.content:
+            content_parts.append(flush.content)
+
+        assert "Brave_Search_brave_web_search" in names
+        content = "".join(content_parts)
+        assert "<function=" not in content
+        assert "</tool_call>" not in content
+
     def test_think_end_then_orphan_function_still_emits_tool(
         self, mock_tokenizer, mock_request
     ):

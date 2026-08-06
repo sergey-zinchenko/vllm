@@ -211,10 +211,19 @@ class TokenIDScanner:
             return [TextChunk(delta_text)] + results
 
         pos = delta_text.find(reconstructed)
-        if pos > 0:
-            return [TextChunk(delta_text[:pos])] + results
-        if pos == 0:
-            return results
+        if pos >= 0:
+            # Keep any hold-back prefix *and* any suffix after the matched
+            # span.  Dropping the suffix used to swallow tool markup that
+            # followed a special-token ``</think>`` in the same delta
+            # (e.g. ``…</think>\n\n<tool_call>…`` with only think-end ids).
+            out: list[LexerInput] = []
+            if pos > 0:
+                out.append(TextChunk(delta_text[:pos]))
+            out.extend(results)
+            end = pos + len(reconstructed)
+            if end < len(delta_text):
+                out.append(TextChunk(delta_text[end:]))
+            return out
 
         # Fallback: SentencePiece context-dependent decoding mismatch.
         # Rebuild from delta_text using PreLexedTerminals as split anchors.

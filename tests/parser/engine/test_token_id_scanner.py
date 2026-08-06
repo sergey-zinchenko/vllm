@@ -179,6 +179,34 @@ class TestHoldbackTextRecovery:
         assert isinstance(result[1], PreLexedTerminal)
         assert result[1].terminal == "THINK_START"
 
+    def test_holdback_keeps_suffix_after_special_token(self, tokenizer):
+        """Prefix + special + suffix must all survive hold-back recovery.
+
+        Detokenizer often emits ``</think>\\n\\n<tool_call>…`` with only the
+        think-end token id. Dropping the suffix used to lose the tool markup.
+        """
+        think_end = "</think>"
+        think_end_id = CHANNEL_END_ID
+        tokenizer.decode.side_effect = lambda ids: {
+            think_end_id: think_end,
+        }.get(ids[0], "?")
+        scanner = TokenIDScanner(
+            token_id_to_terminal={think_end_id: "THINK_END"},
+            tokenizer=tokenizer,
+        )
+        suffix = "\n\n<tool_call>\n<function=foo>\n</function>\n</tool_call>"
+        result = scanner.scan(
+            delta_text=f"holdback{think_end}{suffix}",
+            delta_token_ids=[think_end_id],
+        )
+        assert len(result) == 3
+        assert isinstance(result[0], TextChunk)
+        assert result[0].text == "holdback"
+        assert isinstance(result[1], PreLexedTerminal)
+        assert result[1].terminal == "THINK_END"
+        assert isinstance(result[2], TextChunk)
+        assert result[2].text == suffix
+
     def test_multi_token_batch_special_in_middle(self, scanner, tokenizer):
         """Multi-token batch with special token in the middle."""
         tok_a = 201

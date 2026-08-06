@@ -340,7 +340,18 @@ class StreamingParserEngine:
         events: list[SemanticEvent] = []
         strict = self._token_id_terminal_names if self._ever_had_token_ids else None
         for tok in tokens:
-            if tok.terminal == CONTENT_TERMINAL or (strict and tok.terminal in strict):
+            # Once any special-token id has been seen, text-matched copies of
+            # token_id_terminals are normally demoted to prose so lookalikes
+            # (e.g. a user mentioning ``<tool_call>``) do not fire.  Exception:
+            # when the current state has a real transition for that terminal,
+            # keep it — Qwen often emits ``</think>`` as a special token but
+            # ``<tool_call>`` as ordinary text, and demoting here dumps the
+            # whole tool invoke into content (THINK_END_PENDING / CONTENT).
+            if tok.terminal == CONTENT_TERMINAL or (
+                strict
+                and tok.terminal in strict
+                and (self.state, tok.terminal) not in self.config.transitions
+            ):
                 events.extend(self._on_content(tok.value))
             else:
                 events.extend(self._on_terminal(tok.terminal, tok.value))
@@ -587,16 +598,25 @@ class StreamingParserEngine:
             SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index),
         ]
         content = f"{buffered}{text}"
-        if content:
-            self._feed_markdown_state(content)
-            self._note_answer_content(content)
-            events.append(
-                SemanticEvent(
-                    EventType.TEXT_CHUNK,
-                    value=content,
-                    tool_index=self.tool_index,
-                )
+        if not content:
+            return events
+        # Tool markup may arrive in the same content blob that confirms
+        # ``</think>`` (no separate special-token scan). Re-lex it so
+        # ``<tool_call>`` / ``<function=`` still open a tool instead of
+        # leaking into answer text.
+        stripped = content.lstrip(" \t\r\n")
+        if stripped.startswith("<tool_call") or stripped.startswith("<function="):
+            events.extend(self._process_lex_tokens(self._lexer.feed(content)))
+            return events
+        self._feed_markdown_state(content)
+        self._note_answer_content(content)
+        events.append(
+            SemanticEvent(
+                EventType.TEXT_CHUNK,
+                value=content,
+                tool_index=self.tool_index,
             )
+        )
         return events
 
     def _emit_for_state(self, text: str) -> list[SemanticEvent]:
