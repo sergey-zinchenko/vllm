@@ -7,6 +7,9 @@ Product invariants:
    ``im_end`` / max_tokens / tool end).
 2. ``<|im_end|>`` is phase-aware: banned while the accepted output is still
    in REASONING; allowed once ``</think>`` has closed think.
+3. After think closes, ``im_end`` is also banned while single-backtick
+   token parity is odd (unclosed inline `` `...` ``) so the model cannot
+   stop mid-span after an opening backtick.
 
 Open ``<tool_call>`` regions intentionally do **not** ban ``im_end``.
 Models often cite ``<tool_call>`` as prose in the answer phase without a
@@ -35,6 +38,27 @@ _THINK_START = "<think>"
 _THINK_END = "</think>"
 _TOOL_START = "<tool_call>"
 _TOOL_END = "</tool_call>"
+_INLINE_BACKTICK = "`"
+_FENCE_BACKTICK = "```"
+
+
+# Flattened SamplingParams.extra_args / vllm_xargs key.
+# Values: [im_end_id, think_start_id, think_end_id, tool_start_id,
+#          tool_end_id, initial_reasoning (0/1),
+#          backtick_id?, fence_id?] — missing ids are -1.
+# Trailing fields are optional for backward-compatible parse.
+PHASE_BAN_XARG_KEY = "qwen3_phase_ban"
+
+PhaseBanConfig = tuple[
+    int,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+    bool,
+    int | None,
+    int | None,
+]
 
 
 def resolve_vocab_token_id(vocab: Mapping[str, int], token: str) -> int | None:
@@ -49,12 +73,6 @@ def resolve_endoftext_token_id(vocab: Mapping[str, int]) -> int | None:
 
 def resolve_im_end_token_id(vocab: Mapping[str, int]) -> int | None:
     return resolve_vocab_token_id(vocab, QWEN_IM_END)
-
-
-# Flattened SamplingParams.extra_args / vllm_xargs key.
-# Values: [im_end_id, think_start_id, think_end_id, tool_start_id,
-#          tool_end_id, initial_reasoning (0/1)] — missing ids are -1.
-PHASE_BAN_XARG_KEY = "qwen3_phase_ban"
 
 
 def apply_endoftext_ban_to_request(
@@ -102,6 +120,8 @@ def apply_endoftext_ban_to_request(
         _id(tool_start),
         _id(tool_end),
         1 if initial_reasoning else 0,
+        _id(_INLINE_BACKTICK),
+        _id(_FENCE_BACKTICK),
     ]
     xargs = getattr(request, "vllm_xargs", None)
     if xargs is None:
@@ -113,11 +133,12 @@ def apply_endoftext_ban_to_request(
 
 def parse_phase_ban_config(
     extra_args: Mapping[str, Any] | None,
-) -> tuple[int, int | None, int | None, int | None, int | None, bool] | None:
+) -> PhaseBanConfig | None:
     """Parse flattened ``qwen3_phase_ban`` from SamplingParams.extra_args.
 
     Returns ``(im_end_id, think_start, think_end, tool_start, tool_end,
-    initial_reasoning)`` or ``None`` if unset/invalid.
+    initial_reasoning, backtick_id, fence_id)`` or ``None`` if
+    unset/invalid. Trailing backtick/fence fields are optional.
     """
     if not extra_args:
         return None
@@ -132,6 +153,8 @@ def parse_phase_ban_config(
         i = int(v)
         return i if i >= 0 else None
 
+    backtick_id = _opt(raw[6]) if len(raw) > 6 else None
+    fence_id = _opt(raw[7]) if len(raw) > 7 else None
     return (
         im_end_id,
         _opt(raw[1]),
@@ -139,6 +162,8 @@ def parse_phase_ban_config(
         _opt(raw[3]),
         _opt(raw[4]),
         bool(int(raw[5])),
+        backtick_id,
+        fence_id,
     )
 
 
@@ -173,6 +198,74 @@ def is_in_reasoning_or_tool_phase(
     return in_reasoning
 
 
+def has_open_inline_backtick(
+    output_token_ids: Sequence[int],
+    *,
+    think_start_id: int | None,
+    think_end_id: int | None,
+    backtick_id: int | None,
+    fence_id: int | None = None,
+    initial_reasoning: bool = True,
+) -> bool:
+    """True when answer-phase single-backtick token parity is odd.
+
+    Counts only after the latest ``think_end`` (while not in reasoning).
+    The fence token `` ``` `` is ignored so it does not toggle thrice.
+    """
+    if backtick_id is None:
+        return False
+
+    in_reasoning = initial_reasoning
+    parity = 0
+    for tid in output_token_ids:
+        if think_start_id is not None and tid == think_start_id:
+            in_reasoning = True
+            parity = 0
+            continue
+        if think_end_id is not None and tid == think_end_id:
+            in_reasoning = False
+            parity = 0
+            continue
+        if in_reasoning:
+            continue
+        if fence_id is not None and tid == fence_id:
+            continue
+        if tid == backtick_id:
+            parity ^= 1
+    return parity == 1
+
+
+def should_ban_im_end(
+    output_token_ids: Sequence[int],
+    *,
+    think_start_id: int | None,
+    think_end_id: int | None,
+    tool_start_id: int | None,
+    tool_end_id: int | None,
+    initial_reasoning: bool = True,
+    backtick_id: int | None = None,
+    fence_id: int | None = None,
+) -> bool:
+    """True when ``im_end`` must be banned for the next decode step."""
+    if is_in_reasoning_or_tool_phase(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        tool_start_id=tool_start_id,
+        tool_end_id=tool_end_id,
+        initial_reasoning=initial_reasoning,
+    ):
+        return True
+    return has_open_inline_backtick(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        backtick_id=backtick_id,
+        fence_id=fence_id,
+        initial_reasoning=initial_reasoning,
+    )
+
+
 def phase_banned_token_ids(
     output_token_ids: Sequence[int],
     vocab: Mapping[str, int],
@@ -193,13 +286,15 @@ def phase_banned_token_ids(
             banned.append(eot)
 
     im_end = resolve_im_end_token_id(vocab)
-    if im_end is not None and is_in_reasoning_or_tool_phase(
+    if im_end is not None and should_ban_im_end(
         output_token_ids,
         think_start_id=resolve_vocab_token_id(vocab, think_start),
         think_end_id=resolve_vocab_token_id(vocab, think_end),
         tool_start_id=resolve_vocab_token_id(vocab, tool_start),
         tool_end_id=resolve_vocab_token_id(vocab, tool_end),
         initial_reasoning=initial_reasoning,
+        backtick_id=resolve_vocab_token_id(vocab, _INLINE_BACKTICK),
+        fence_id=resolve_vocab_token_id(vocab, _FENCE_BACKTICK),
     ):
         banned.append(im_end)
 
@@ -227,14 +322,25 @@ def banned_ids_for_request(
     cfg = parse_phase_ban_config(extra_args)
     if cfg is None:
         return []
-    im_end_id, think_start, think_end, tool_start, tool_end, initial = cfg
-    if is_in_reasoning_or_tool_phase(
+    (
+        im_end_id,
+        think_start,
+        think_end,
+        tool_start,
+        tool_end,
+        initial,
+        backtick_id,
+        fence_id,
+    ) = cfg
+    if should_ban_im_end(
         output_token_ids,
         think_start_id=think_start,
         think_end_id=think_end,
         tool_start_id=tool_start,
         tool_end_id=tool_end,
         initial_reasoning=initial,
+        backtick_id=backtick_id,
+        fence_id=fence_id,
     ):
         return [im_end_id]
     return []
@@ -249,14 +355,25 @@ def should_ignore_stop_token(
     cfg = parse_phase_ban_config(extra_args)
     if cfg is None:
         return False
-    im_end_id, think_start, think_end, tool_start, tool_end, initial = cfg
+    (
+        im_end_id,
+        think_start,
+        think_end,
+        tool_start,
+        tool_end,
+        initial,
+        backtick_id,
+        fence_id,
+    ) = cfg
     if token_id != im_end_id:
         return False
-    return is_in_reasoning_or_tool_phase(
+    return should_ban_im_end(
         output_token_ids_before,
         think_start_id=think_start,
         think_end_id=think_end,
         tool_start_id=tool_start,
         tool_end_id=tool_end,
         initial_reasoning=initial,
+        backtick_id=backtick_id,
+        fence_id=fence_id,
     )

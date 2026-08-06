@@ -168,12 +168,12 @@ class TestNonStreaming:
         assert "</think>" not in (content or "")
         assert "<think>" not in (content or "")
 
-    def test_duplicate_think_end_absorbed(self, parser):
-        """Duplicate </think> in CONTENT state must not leak."""
+    def test_duplicate_think_end_visible_in_content(self, parser):
+        """Duplicate </think> in CONTENT stays visible (never silent-drop)."""
         text = "Reasoning here.</think>Content here.</think>More content."
         reasoning, content = parser.extract_reasoning(text, None)
         assert reasoning == "Reasoning here."
-        assert content == "Content here.More content."
+        assert content == "Content here.</think>More content."
 
 
 class TestIsReasoningEnd:
@@ -462,8 +462,8 @@ class TestStreaming:
         assert "</think>" not in content
         assert "<think>" not in reasoning
 
-    def test_streaming_duplicate_think_end_absorbed(self, parser):
-        """Duplicate </think> token in CONTENT state must not leak."""
+    def test_streaming_duplicate_think_end_visible_in_content(self, parser):
+        """Duplicate </think> in CONTENT emits as text (never silent-drop)."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
             ["reasoning", "</think>", "Content", "</think>", "More"],
@@ -476,7 +476,24 @@ class TestStreaming:
             ],
         )
         assert reasoning == "reasoning"
-        assert content == "ContentMore"
+        assert content == "Content</think>More"
+
+    def test_streaming_think_end_in_content_keeps_stream(self, parser):
+        """Mid-answer special </think> is visible text; stream continues."""
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["reasoning", "</think>", "Foo ", "</think>", " bar"],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert reasoning == "reasoning"
+        assert content == "Foo </think> bar"
+        assert "</think>" in content
 
 
 class TestTrailingWhitespaceStripping:

@@ -10,8 +10,10 @@ from vllm.parser.qwen3_phase_stop import (
     QWEN_IM_END,
     apply_endoftext_ban_to_request,
     banned_ids_for_request,
+    has_open_inline_backtick,
     is_in_reasoning_or_tool_phase,
     parse_phase_ban_config,
+    should_ban_im_end,
     should_ignore_stop_token,
 )
 
@@ -21,6 +23,8 @@ _TOOL_START = 20
 _TOOL_END = 21
 _IM_END = 30
 _EOT = 31
+_BACKTICK = 40
+_FENCE = 41
 
 
 _VOCAB = {
@@ -30,6 +34,8 @@ _VOCAB = {
     "</tool_call>": _TOOL_END,
     QWEN_IM_END: _IM_END,
     QWEN_END_OF_TEXT: _EOT,
+    "`": _BACKTICK,
+    "```": _FENCE,
 }
 
 
@@ -88,6 +94,83 @@ class TestPhaseDetection:
         )
 
 
+class TestInlineBacktickParity:
+    def test_odd_backtick_after_think_end_bans_im_end(self):
+        ids = [_THINK_END, 1, _BACKTICK, 2]
+        assert has_open_inline_backtick(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+            initial_reasoning=False,
+        )
+        assert should_ban_im_end(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            tool_start_id=_TOOL_START,
+            tool_end_id=_TOOL_END,
+            initial_reasoning=False,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+        )
+
+    def test_even_backtick_after_think_end_allows_im_end(self):
+        ids = [_THINK_END, 1, _BACKTICK, 2, _BACKTICK]
+        assert not has_open_inline_backtick(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+            initial_reasoning=False,
+        )
+        assert not should_ban_im_end(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            tool_start_id=_TOOL_START,
+            tool_end_id=_TOOL_END,
+            initial_reasoning=False,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+        )
+
+    def test_still_in_reasoning_bans_regardless_of_backticks(self):
+        ids = [_THINK_START, _BACKTICK, _BACKTICK]
+        assert should_ban_im_end(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            tool_start_id=_TOOL_START,
+            tool_end_id=_TOOL_END,
+            initial_reasoning=True,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+        )
+        # Backticks inside think do not open answer-phase parity.
+        assert not has_open_inline_backtick(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+            initial_reasoning=True,
+        )
+
+    def test_fence_token_does_not_toggle_parity(self):
+        ids = [_THINK_END, _FENCE, 1, _FENCE]
+        assert not has_open_inline_backtick(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+            initial_reasoning=False,
+        )
+
+
 class TestRequestWiring:
     def test_apply_endoftext_ban_sets_bad_words_not_logit_bias(self):
         """logit_bias is forbidden with MTP — ban via bad_words only."""
@@ -102,6 +185,26 @@ class TestRequestWiring:
         cfg = parse_phase_ban_config(req.vllm_xargs)
         assert cfg is not None
         assert cfg[0] == _IM_END
+        assert cfg[6] == _BACKTICK
+        assert cfg[7] == _FENCE
+
+    def test_parse_phase_ban_config_backward_compatible_without_backtick(self):
+        """Legacy 6-field configs still parse (backtick/fence None)."""
+        cfg = parse_phase_ban_config(
+            {
+                PHASE_BAN_XARG_KEY: [
+                    _IM_END,
+                    _THINK_START,
+                    _THINK_END,
+                    _TOOL_START,
+                    _TOOL_END,
+                    1,
+                ]
+            }
+        )
+        assert cfg is not None
+        assert cfg[6] is None
+        assert cfg[7] is None
 
     def test_endoftext_ban_compatible_with_speculative_verify(self):
         """Regression: adjust_request must not trip MTP logit_bias reject."""
@@ -133,10 +236,30 @@ class TestRequestWiring:
                 _TOOL_START,
                 _TOOL_END,
                 1,
+                _BACKTICK,
+                _FENCE,
             ]
         }
         assert banned_ids_for_request([1, 2], extra) == [_IM_END]
         assert banned_ids_for_request([_THINK_END, 3], extra) == []
+
+    def test_banned_ids_for_request_odd_backtick_parity(self):
+        extra = {
+            PHASE_BAN_XARG_KEY: [
+                _IM_END,
+                _THINK_START,
+                _THINK_END,
+                _TOOL_START,
+                _TOOL_END,
+                0,
+                _BACKTICK,
+                _FENCE,
+            ]
+        }
+        assert banned_ids_for_request([_THINK_END, _BACKTICK], extra) == [_IM_END]
+        assert (
+            banned_ids_for_request([_THINK_END, _BACKTICK, 1, _BACKTICK], extra) == []
+        )
 
     def test_should_ignore_stop_token(self):
         extra = {
@@ -147,8 +270,11 @@ class TestRequestWiring:
                 _TOOL_START,
                 _TOOL_END,
                 1,
+                _BACKTICK,
+                _FENCE,
             ]
         }
         assert should_ignore_stop_token(_IM_END, [1, 2], extra)
         assert not should_ignore_stop_token(_IM_END, [_THINK_END], extra)
+        assert should_ignore_stop_token(_IM_END, [_THINK_END, _BACKTICK], extra)
         assert not should_ignore_stop_token(999, [1, 2], extra)

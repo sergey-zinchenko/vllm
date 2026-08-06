@@ -290,10 +290,11 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
     """Phase-aware ``<|im_end|>`` ban for Qwen3 hardened serving.
 
     While accepted output is still in REASONING, ``im_end`` logits are set
-    to ``-inf``. Open tool markup does not ban stop (prose citations of
-    ``<tool_call>`` must remain stoppable). Works with speculative
-    decoding via :meth:`apply_with_spec_decode` (same pattern as
-    min-tokens).
+    to ``-inf``. After think closes, odd single-backtick token parity also
+    bans ``im_end`` (unclosed inline code span). Open tool markup does not
+    ban stop (prose citations of ``<tool_call>`` must remain stoppable).
+    Works with speculative decoding via :meth:`apply_with_spec_decode`
+    (same pattern as min-tokens).
     """
 
     def __init__(
@@ -304,7 +305,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         self._parse_phase_ban_config = parse_phase_ban_config
         self.device = device
         # index -> (im_end_id, output_tok_ids, think_start, think_end,
-        #           tool_start, tool_end, initial_reasoning)
+        #           tool_start, tool_end, initial_reasoning, backtick_id,
+        #           fence_id)
         self.reqs: dict[
             int,
             tuple[
@@ -315,6 +317,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                 int | None,
                 int | None,
                 bool,
+                int | None,
+                int | None,
             ],
         ] = {}
         self.neg_inf_tensor = torch.tensor(
@@ -330,13 +334,32 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         _: list[int] | None,
         output_tok_ids: list[int],
     ) -> (
-        tuple[int, Sequence[int], int | None, int | None, int | None, int | None, bool]
+        tuple[
+            int,
+            Sequence[int],
+            int | None,
+            int | None,
+            int | None,
+            int | None,
+            bool,
+            int | None,
+            int | None,
+        ]
         | None
     ):
         cfg = self._parse_phase_ban_config(params.extra_args)
         if cfg is None:
             return None
-        im_end_id, think_start, think_end, tool_start, tool_end, initial = cfg
+        (
+            im_end_id,
+            think_start,
+            think_end,
+            tool_start,
+            tool_end,
+            initial,
+            backtick_id,
+            fence_id,
+        ) = cfg
         return (
             im_end_id,
             output_tok_ids,
@@ -345,10 +368,12 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             tool_start,
             tool_end,
             initial,
+            backtick_id,
+            fence_id,
         )
 
     def _active_ban_reqs(self) -> list[tuple[int, int]]:
-        from vllm.parser.qwen3_phase_stop import is_in_reasoning_or_tool_phase
+        from vllm.parser.qwen3_phase_stop import should_ban_im_end
 
         active: list[tuple[int, int]] = []
         for req_idx, (
@@ -359,14 +384,18 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             tool_start,
             tool_end,
             initial,
+            backtick_id,
+            fence_id,
         ) in self.reqs.items():
-            if is_in_reasoning_or_tool_phase(
+            if should_ban_im_end(
                 out_tok_ids,
                 think_start_id=think_start,
                 think_end_id=think_end,
                 tool_start_id=tool_start,
                 tool_end_id=tool_end,
                 initial_reasoning=initial,
+                backtick_id=backtick_id,
+                fence_id=fence_id,
             ):
                 active.append((req_idx, im_end_id))
         return active

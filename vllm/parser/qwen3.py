@@ -124,11 +124,15 @@ def qwen3_config(
             ParserState.THINK_END_PENDING,
             (),
         ),
-        # Absorb duplicate </think> — model may emit it after
-        # already transitioning to CONTENT; drop it silently.
+        # Duplicate / cited </think> in the answer — keep as visible text
+        # (never silent-drop; mid-answer mentions must not create holes).
         (ParserState.CONTENT, "THINK_END"): Transition(
             ParserState.CONTENT,
-            (),
+            (EventType.TEXT_CHUNK,),
+        ),
+        (ParserState.CONTENT, "THINK_START"): Transition(
+            ParserState.CONTENT,
+            (EventType.TEXT_CHUNK,),
         ),
         (ParserState.THINK_END_PENDING, "THINK_END"): Transition(
             ParserState.THINK_END_PENDING,
