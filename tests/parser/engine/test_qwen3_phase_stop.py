@@ -94,6 +94,58 @@ class TestPhaseDetection:
         )
 
 
+class TestThinkCitationAfterClose:
+    """A cited ``<think>`` special id in the answer must not re-arm bans.
+
+    Screenshot scenario: chat about think tags, model emits a real
+    ``<think>`` token id mid-answer after reasoning already closed. No
+    second ``</think>`` ever comes, so re-entering the ban phase makes
+    ``im_end`` banned forever (endless generation) and a sampled
+    ``im_end`` ignored by check_stop (rewritten tails). One generation
+    has at most one legitimate think block — post-tool re-think is a
+    separate request.
+    """
+
+    _CFG = {
+        PHASE_BAN_XARG_KEY: [
+            _IM_END,
+            _THINK_START,
+            _THINK_END,
+            _TOOL_START,
+            _TOOL_END,
+            1,
+            _BACKTICK,
+            _FENCE,
+        ]
+    }
+    # think closed, answer prose, cited <think> id, more prose
+    _CITED_THINK = [_THINK_START, 1, _THINK_END, 2, _THINK_START, 3]
+
+    def test_think_start_after_close_is_not_reasoning(self):
+        assert not is_in_reasoning_or_tool_phase(
+            self._CITED_THINK,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            tool_start_id=_TOOL_START,
+            tool_end_id=_TOOL_END,
+            initial_reasoning=True,
+        )
+
+    def test_think_start_after_close_does_not_ban_im_end(self):
+        assert banned_ids_for_request(self._CITED_THINK, self._CFG) == []
+
+    def test_think_start_after_close_does_not_ignore_stop(self):
+        assert not should_ignore_stop_token(_IM_END, self._CITED_THINK, self._CFG)
+
+    def test_open_think_still_bans(self):
+        # Control: genuine unclosed think keeps the ban (unchanged).
+        assert banned_ids_for_request([_THINK_START, 1], self._CFG) == [_IM_END]
+
+    def test_closed_think_still_allows(self):
+        # Control: closed think allows im_end (unchanged).
+        assert banned_ids_for_request([_THINK_START, 1, _THINK_END, 2], self._CFG) == []
+
+
 class TestDanglingBacktick:
     """The im_end ban must be non-sticky: only the single step right after
     a lone `` ` `` token blocks stop. Parity counting deadlocks (BPE merges

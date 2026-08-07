@@ -181,19 +181,28 @@ def is_in_reasoning_or_tool_phase(
 
     Returns ``True`` when ``im_end`` must be banned (still inside think).
 
+    One-way latch: after the first ``think_end`` the phase never re-enters
+    reasoning. A generation has at most one legitimate think block
+    (post-tool re-think is a separate request), so a later ``think_start``
+    id is a citation in the answer — re-arming the ban on it made
+    ``im_end`` unbannable forever (endless generation / rewritten tails).
+
     ``tool_start_id`` / ``tool_end_id`` are accepted for config compatibility
     but do not affect the ban: unpaired ``<tool_call>`` in prose must not
     block stop tokens.
     """
     del tool_start_id, tool_end_id
     in_reasoning = initial_reasoning
+    think_closed = False
 
     for tid in output_token_ids:
         if think_start_id is not None and tid == think_start_id:
-            in_reasoning = True
+            if not think_closed:
+                in_reasoning = True
             continue
         if think_end_id is not None and tid == think_end_id:
             in_reasoning = False
+            think_closed = True
             continue
 
     return in_reasoning
