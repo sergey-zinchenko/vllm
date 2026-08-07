@@ -891,11 +891,12 @@ class SamplingParams(
         if speculative_config is None:
             return
 
-        # Some sampling parameters are not yet compatible with spec decoding.
-        if self.min_p > _SAMPLING_EPS or self.logit_bias:
+        # logit_bias is not yet wired through rejection sampling under MTP.
+        # min_p is supported via MinPLogitsProcessor.apply_with_spec_decode.
+        if self.logit_bias:
             raise VLLMValidationError(
-                "The min_p and logit_bias sampling parameters "
-                "are not yet supported with speculative decoding."
+                "The logit_bias sampling parameter "
+                "is not yet supported with speculative decoding."
             )
 
     def _validate_diffusion(self, model_config: ModelConfig) -> None:

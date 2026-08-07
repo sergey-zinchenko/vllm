@@ -204,13 +204,12 @@ def build_logitsprocs(
     if vllm_config.speculative_config:
         if custom_logitsprocs:
             raise ValueError(STR_SPEC_DEC_REJECTS_LOGITSPROCS)
-        logger.warning(
-            "min_p and logit_bias parameters won't work with speculative decoding."
-        )
-        # Keep min-tokens + Qwen3 phase-aware im_end ban under MTP.
+        logger.warning("logit_bias parameter won't work with speculative decoding.")
+        # Keep min-tokens, min_p, and Qwen3 phase-aware im_end ban under MTP.
         return LogitsProcessors(
             [
                 MinTokensLogitsProcessor(vllm_config, device, is_pin_memory),
+                MinPLogitsProcessor(vllm_config, device, is_pin_memory),
                 Qwen3PhaseStopLogitsProcessor(vllm_config, device, is_pin_memory),
             ]
         )

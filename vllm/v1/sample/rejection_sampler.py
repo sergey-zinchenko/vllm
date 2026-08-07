@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.sample.logits_processor.builtin import (
+    MinPLogitsProcessor,
     MinTokensLogitsProcessor,
     Qwen3PhaseStopLogitsProcessor,
 )
@@ -334,9 +335,16 @@ class RejectionSampler(nn.Module):
                 logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens
             )
 
-        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+        # MinP is argmax-invariant (skipped for greedy) but must still run
+        # under temperature sampling during rejection verification.
+        for processor in sampling_metadata.logitsprocs.all:
             if isinstance(
-                processor, (MinTokensLogitsProcessor, Qwen3PhaseStopLogitsProcessor)
+                processor,
+                (
+                    MinTokensLogitsProcessor,
+                    MinPLogitsProcessor,
+                    Qwen3PhaseStopLogitsProcessor,
+                ),
             ):
                 logits = processor.apply_with_spec_decode(
                     logits, metadata.num_draft_tokens

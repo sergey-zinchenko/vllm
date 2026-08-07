@@ -220,11 +220,12 @@ class TestRequestWiring:
 
         params = SamplingParams(
             max_tokens=16,
+            min_p=0.05,
             bad_words=list(req.bad_words),
             logit_bias=req.logit_bias,
             extra_args=dict(req.vllm_xargs) if req.vllm_xargs else None,
         )
-        # Must not raise (stock image + MTP works; our old logit_bias broke it).
+        # Must not raise: bad_words + min_p are MTP-safe; logit_bias is not.
         params._validate_spec_decode(speculative_config=object())
 
     def test_banned_ids_for_request_in_reasoning(self):

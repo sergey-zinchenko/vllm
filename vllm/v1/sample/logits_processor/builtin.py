@@ -25,6 +25,7 @@ class MinPLogitsProcessor(LogitsProcessor):
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
     ):
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        self.device = device
         self.min_p_count: int = 0
 
         self.min_p_cpu_tensor = torch.zeros(
@@ -99,21 +100,45 @@ class MinPLogitsProcessor(LogitsProcessor):
                 self.min_p.copy_(self.min_p_cpu_tensor[:size], non_blocking=True)
             self.min_p.unsqueeze_(1)
 
+    def _apply_min_p(self, logits: torch.Tensor, min_p: torch.Tensor) -> torch.Tensor:
+        """Mask tokens below ``max_prob * min_p`` for each logits row."""
+        probability_values = torch.nn.functional.softmax(logits, dim=-1)
+        max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)
+        adjusted_min_p = max_probabilities.mul_(min_p)
+        invalid_token_mask = probability_values < adjusted_min_p
+        logits.masked_fill_(invalid_token_mask, -float("inf"))
+        return logits
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.min_p_count:
             return logits
+        return self._apply_min_p(logits, self.min_p)
 
-        # Convert logits to probability distribution
-        probability_values = torch.nn.functional.softmax(logits, dim=-1)
-        # Calculate maximum probabilities per sequence
-        max_probabilities = torch.amax(probability_values, dim=-1, keepdim=True)
-        # Adjust min_p
-        adjusted_min_p = max_probabilities.mul_(self.min_p)
-        # Identify valid tokens using threshold comparison
-        invalid_token_mask = probability_values < adjusted_min_p
-        # Apply mask using boolean indexing
-        logits.masked_fill_(invalid_token_mask, -float("inf"))
-        return logits
+    def apply_with_spec_decode(
+        self,
+        logits: torch.Tensor,
+        num_draft_tokens: list[int],
+    ) -> torch.Tensor:
+        """Apply min_p on expanded draft rows.
+
+        Example: ``num_draft_tokens = [2, 3, 1]``
+          → ``logits`` shape ``[6, V]``; each request's ``min_p`` is
+          repeated across its draft rows before thresholding.
+        """
+        if not self.min_p_count:
+            return logits
+
+        num_draft_arr = np.asarray(num_draft_tokens, dtype=np.int64)
+        total_rows = int(num_draft_arr.sum())
+        if total_rows == 0:
+            return logits
+
+        # Expand per-request min_p to one value per draft/verification row.
+        row_min_p = np.repeat(
+            self.min_p_cpu[: len(num_draft_tokens)], num_draft_arr
+        ).astype(np.float32, copy=False)
+        min_p = async_tensor_h2d(row_min_p, device=self.device).unsqueeze(1)
+        return self._apply_min_p(logits, min_p)
 
 
 class LogitBiasLogitsProcessor(LogitsProcessor):
