@@ -401,10 +401,10 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             trailing_backtick_ids,
         )
 
-    def _active_ban_reqs(self) -> list[tuple[int, int]]:
-        from vllm.parser.qwen3_phase_stop import should_ban_im_end
+    def _active_ban_reqs(self) -> list[tuple[int, list[int]]]:
+        from vllm.parser.qwen3_phase_stop import step_banned_ids
 
-        active: list[tuple[int, int]] = []
+        active: list[tuple[int, list[int]]] = []
         for req_idx, (
             im_end_id,
             out_tok_ids,
@@ -417,8 +417,9 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             fence_id,
             trailing_backtick_ids,
         ) in self.reqs.items():
-            if should_ban_im_end(
+            banned = step_banned_ids(
                 out_tok_ids,
+                im_end_id=im_end_id,
                 think_start_id=think_start,
                 think_end_id=think_end,
                 tool_start_id=tool_start,
@@ -427,8 +428,9 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                 backtick_id=backtick_id,
                 fence_id=fence_id,
                 trailing_backtick_ids=trailing_backtick_ids,
-            ):
-                active.append((req_idx, im_end_id))
+            )
+            if banned:
+                active.append((req_idx, banned))
         return active
 
     def update_state(self, batch_update: BatchUpdate | None):
@@ -442,8 +444,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         active = self._active_ban_reqs()
         if not active:
             return logits
-        reqs = [r for r, _ in active]
-        toks = [t for _, t in active]
+        reqs = [r for r, ids in active for _ in ids]
+        toks = [t for _, ids in active for t in ids]
         logits_slice = (
             self._device_tensor(reqs, torch.int32),
             self._device_tensor(toks, torch.int32),
@@ -456,7 +458,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         logits: torch.Tensor,
         num_draft_tokens: list[int],
     ) -> torch.Tensor:
-        """Ban ``im_end`` on all draft rows while still in ban phase."""
+        """Ban the active id set on all draft rows while in ban phase."""
         active = self._active_ban_reqs()
         if not active:
             return logits
@@ -466,14 +468,15 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         all_rows: list[np.ndarray] = []
         all_toks: list[np.ndarray] = []
 
-        active_map = {req_idx: im_end for req_idx, im_end in active}
-        for req_idx, im_end_id in active_map.items():
+        for req_idx, banned_ids in active:
             n = int(num_draft_arr[req_idx])
             if n <= 0:
                 continue
             offset = cumsum[req_idx]
-            all_rows.append(np.arange(offset, offset + n, dtype=np.int64))
-            all_toks.append(np.full(n, im_end_id, dtype=np.int64))
+            rows = np.arange(offset, offset + n, dtype=np.int64)
+            for tid in banned_ids:
+                all_rows.append(rows)
+                all_toks.append(np.full(n, tid, dtype=np.int64))
 
         if all_rows:
             rows_arr = np.concatenate(all_rows)

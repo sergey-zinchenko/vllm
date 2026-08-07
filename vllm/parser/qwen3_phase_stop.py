@@ -257,12 +257,14 @@ def ends_with_dangling_backtick(
     initial_reasoning: bool = True,
     trailing_backtick_ids: frozenset[int] = frozenset(),
 ) -> bool:
-    """True when the last answer-phase token ends with an opening `` ` ``.
+    """True when the last token ends with an opening `` ` `` — any phase.
 
     Matches the lone `` ` `` id and merged BPE forms (``" `"``, ``"(`"``
     ...) whose text ends with exactly one backtick — prose openings almost
     never tokenize as the bare backtick, and the truncation happens right
-    after those merged forms.
+    after those merged forms. Applies inside reasoning too: the model
+    cites `` `</think>` `` mid-think, and only the structural-id ban keeps
+    the real special token from closing the block mid-citation.
 
     Deliberately **not** span parity: counting one vocab id sees only one
     side of real inline spans, sticks odd, and bans ``im_end`` for the
@@ -271,20 +273,11 @@ def ends_with_dangling_backtick(
     right after opening backtick" pattern while staying non-sticky: any
     other token re-allows ``im_end``.
     """
-    del fence_id
+    del think_start_id, think_end_id, fence_id, initial_reasoning
     if not output_token_ids:
         return False
     last = output_token_ids[-1]
-    if last != backtick_id and last not in trailing_backtick_ids:
-        return False
-    return not is_in_reasoning_or_tool_phase(
-        output_token_ids,
-        think_start_id=think_start_id,
-        think_end_id=think_end_id,
-        tool_start_id=None,
-        tool_end_id=None,
-        initial_reasoning=initial_reasoning,
-    )
+    return last == backtick_id or last in trailing_backtick_ids
 
 
 def should_ban_im_end(
@@ -320,6 +313,60 @@ def should_ban_im_end(
     )
 
 
+def step_banned_ids(
+    output_token_ids: Sequence[int],
+    *,
+    im_end_id: int | None,
+    think_start_id: int | None,
+    think_end_id: int | None,
+    tool_start_id: int | None,
+    tool_end_id: int | None,
+    initial_reasoning: bool = True,
+    backtick_id: int | None = None,
+    fence_id: int | None = None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
+) -> list[int]:
+    """Token ids banned for the next decode step.
+
+    Two independent rules compose:
+    - reasoning phase: ``im_end`` banned while inside the think block;
+    - dangling backtick: the whole structural family (``im_end`` + think
+      and tool tags) banned for exactly one step after an opening
+      `` ` ``, so a cited special token must be spelled as plain text
+      instead of emitted as the real id (which closes reasoning or ends
+      the message mid-citation).
+    """
+    banned: list[int] = []
+    if im_end_id is not None and is_in_reasoning_or_tool_phase(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        tool_start_id=tool_start_id,
+        tool_end_id=tool_end_id,
+        initial_reasoning=initial_reasoning,
+    ):
+        banned.append(im_end_id)
+    if ends_with_dangling_backtick(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        backtick_id=backtick_id,
+        fence_id=fence_id,
+        initial_reasoning=initial_reasoning,
+        trailing_backtick_ids=trailing_backtick_ids,
+    ):
+        for tid in (
+            im_end_id,
+            think_start_id,
+            think_end_id,
+            tool_start_id,
+            tool_end_id,
+        ):
+            if tid is not None and tid not in banned:
+                banned.append(tid)
+    return banned
+
+
 def phase_banned_token_ids(
     output_token_ids: Sequence[int],
     vocab: Mapping[str, int],
@@ -339,20 +386,20 @@ def phase_banned_token_ids(
         if eot is not None:
             banned.append(eot)
 
-    im_end = resolve_im_end_token_id(vocab)
-    if im_end is not None and should_ban_im_end(
-        output_token_ids,
-        think_start_id=resolve_vocab_token_id(vocab, think_start),
-        think_end_id=resolve_vocab_token_id(vocab, think_end),
-        tool_start_id=resolve_vocab_token_id(vocab, tool_start),
-        tool_end_id=resolve_vocab_token_id(vocab, tool_end),
-        initial_reasoning=initial_reasoning,
-        backtick_id=resolve_vocab_token_id(vocab, _INLINE_BACKTICK),
-        fence_id=resolve_vocab_token_id(vocab, _FENCE_BACKTICK),
-        trailing_backtick_ids=frozenset(trailing_backtick_token_ids(vocab)),
-    ):
-        banned.append(im_end)
-
+    banned.extend(
+        step_banned_ids(
+            output_token_ids,
+            im_end_id=resolve_im_end_token_id(vocab),
+            think_start_id=resolve_vocab_token_id(vocab, think_start),
+            think_end_id=resolve_vocab_token_id(vocab, think_end),
+            tool_start_id=resolve_vocab_token_id(vocab, tool_start),
+            tool_end_id=resolve_vocab_token_id(vocab, tool_end),
+            initial_reasoning=initial_reasoning,
+            backtick_id=resolve_vocab_token_id(vocab, _INLINE_BACKTICK),
+            fence_id=resolve_vocab_token_id(vocab, _FENCE_BACKTICK),
+            trailing_backtick_ids=frozenset(trailing_backtick_token_ids(vocab)),
+        )
+    )
     return banned
 
 
@@ -388,8 +435,9 @@ def banned_ids_for_request(
         fence_id,
         trailing_backtick_ids,
     ) = cfg
-    if should_ban_im_end(
+    return step_banned_ids(
         output_token_ids,
+        im_end_id=im_end_id,
         think_start_id=think_start,
         think_end_id=think_end,
         tool_start_id=tool_start,
@@ -398,9 +446,7 @@ def banned_ids_for_request(
         backtick_id=backtick_id,
         fence_id=fence_id,
         trailing_backtick_ids=trailing_backtick_ids,
-    ):
-        return [im_end_id]
-    return []
+    )
 
 
 def should_ignore_stop_token(

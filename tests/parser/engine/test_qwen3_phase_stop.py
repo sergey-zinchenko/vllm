@@ -122,12 +122,12 @@ class TestMergedBacktickStopGuard:
     def test_merged_space_backtick_bans_im_end(self):
         cfg = self._cfg()
         ids = [_THINK_END, 1, _SPACE_BACKTICK]
-        assert banned_ids_for_request(ids, cfg) == [_IM_END]
+        assert _IM_END in banned_ids_for_request(ids, cfg)
 
     def test_merged_paren_backtick_bans_im_end(self):
         cfg = self._cfg()
         ids = [_THINK_END, 1, _PAREN_BACKTICK]
-        assert banned_ids_for_request(ids, cfg) == [_IM_END]
+        assert _IM_END in banned_ids_for_request(ids, cfg)
 
     def test_config_carries_trailing_backtick_ids(self):
         raw = self._cfg()[PHASE_BAN_XARG_KEY]
@@ -143,9 +143,8 @@ class TestMergedBacktickStopGuard:
         assert _FENCE not in tail
 
     def test_lone_backtick_still_bans(self):
-        # Control (green on current code).
         cfg = self._cfg()
-        assert banned_ids_for_request([_THINK_END, 1, _BACKTICK], cfg) == [_IM_END]
+        assert _IM_END in banned_ids_for_request([_THINK_END, 1, _BACKTICK], cfg)
 
     def test_merged_backtick_ban_is_non_sticky(self):
         # Control: any token after the merged backtick re-allows im_end.
@@ -154,6 +153,59 @@ class TestMergedBacktickStopGuard:
 
     def test_stop_ignore_stays_reasoning_only(self):
         # Control: a sampled im_end after a merged backtick is never ignored.
+        cfg = self._cfg()
+        assert not should_ignore_stop_token(
+            _IM_END, [_THINK_END, 1, _SPACE_BACKTICK], cfg
+        )
+
+
+class TestBacktickCitedStructuralIds:
+    """A dangling backtick must ban the whole structural id family.
+
+    Screenshot scenario: mid-reasoning the model writes "... Qwen3.6 `"
+    and reaches for a structural id to cite it. With only im_end banned,
+    it emits the real ``</think>`` — reasoning closes for real
+    mid-citation, the following ``<think>`` is latched as citation text,
+    and the very next im_end ends the message with the answer eaten.
+    Banning think/tool ids for one step after the backtick forces the
+    citation to be spelled with plain-text tokens instead.
+    """
+
+    def _cfg(self):
+        req = MagicMock()
+        req.logit_bias = None
+        req.bad_words = []
+        req.vllm_xargs = None
+        apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
+        return req.vllm_xargs
+
+    def test_reasoning_backtick_bans_think_end(self):
+        # The screenshot bug: </think> sampleable right after " `".
+        banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
+        assert _THINK_END in banned
+
+    def test_reasoning_backtick_bans_whole_family(self):
+        banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
+        assert {_IM_END, _THINK_START, _THINK_END, _TOOL_START, _TOOL_END} <= banned
+
+    def test_answer_backtick_bans_think_start(self):
+        ids = [_THINK_END, 1, _SPACE_BACKTICK]
+        banned = set(banned_ids_for_request(ids, self._cfg()))
+        assert _THINK_START in banned
+        assert _IM_END in banned
+
+    def test_lone_backtick_bans_family_too(self):
+        banned = set(banned_ids_for_request([1, _BACKTICK], self._cfg()))
+        assert {_THINK_END, _TOOL_START} <= banned
+
+    def test_family_ban_is_non_sticky(self):
+        # Control: one token later a legit </think> close is allowed again;
+        # only the reasoning-phase im_end ban remains.
+        cfg = self._cfg()
+        assert banned_ids_for_request([1, _SPACE_BACKTICK, 2], cfg) == [_IM_END]
+
+    def test_stop_ignore_stays_reasoning_only(self):
+        # Control: the backtick rule never rescues an already-sampled stop.
         cfg = self._cfg()
         assert not should_ignore_stop_token(
             _IM_END, [_THINK_END, 1, _SPACE_BACKTICK], cfg
@@ -273,8 +325,9 @@ class TestDanglingBacktick:
             backtick_id=_BACKTICK,
             fence_id=_FENCE,
         )
-        # Backtick at the end of think content is not an answer-phase rule.
-        assert not ends_with_dangling_backtick(
+        # The backtick rule fires mid-think too: a cited `</think>` there
+        # would close reasoning for real (structural family ban).
+        assert ends_with_dangling_backtick(
             ids,
             think_start_id=_THINK_START,
             think_end_id=_THINK_END,
@@ -391,7 +444,7 @@ class TestRequestWiring:
                 _FENCE,
             ]
         }
-        assert banned_ids_for_request([_THINK_END, _BACKTICK], extra) == [_IM_END]
+        assert _IM_END in banned_ids_for_request([_THINK_END, _BACKTICK], extra)
         # Non-sticky: any token after the backtick re-allows im_end.
         assert banned_ids_for_request([_THINK_END, _BACKTICK, 1], extra) == []
 
