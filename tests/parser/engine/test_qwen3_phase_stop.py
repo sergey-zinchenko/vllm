@@ -159,16 +159,17 @@ class TestMergedBacktickStopGuard:
         )
 
 
-class TestBacktickCitedStructuralIds:
-    """A dangling backtick must ban the whole structural id family.
+class TestBacktickCitationIdsAllowed:
+    """A dangling backtick bans only ``im_end`` — structural ids stay legal.
 
-    Screenshot scenario: mid-reasoning the model writes "... Qwen3.6 `"
-    and reaches for a structural id to cite it. With only im_end banned,
-    it emits the real ``</think>`` — reasoning closes for real
-    mid-citation, the following ``<think>`` is latched as citation text,
-    and the very next im_end ends the message with the answer eaten.
-    Banning think/tool ids for one step after the backtick forces the
-    citation to be spelled with plain-text tokens instead.
+    Regression (screenshot series, same prompt replayed): banning the
+    whole think/tool id family after an opening `` ` `` knocked the model
+    off its citation path — it bailed into a newline + early ``</think>``
+    and the sentence lost its tail ("… fix the `" then nothing). Cited
+    special ids inside backticks are handled by the parser instead (the
+    markdown-code inert rule keeps them raw prose), so the sampler must
+    not fight them. Only the original "stop right after an opening
+    backtick" im_end guard remains.
     """
 
     def _cfg(self):
@@ -179,28 +180,29 @@ class TestBacktickCitedStructuralIds:
         apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
         return req.vllm_xargs
 
-    def test_reasoning_backtick_bans_think_end(self):
-        # The screenshot bug: </think> sampleable right after " `".
+    def test_reasoning_backtick_allows_think_end(self):
+        # A cited `</think>` id right after " `" must be sampleable;
+        # the parser's markdown-inert rule keeps it prose.
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert _THINK_END in banned
-
-    def test_reasoning_backtick_bans_whole_family(self):
-        banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert {_IM_END, _THINK_START, _THINK_END, _TOOL_START, _TOOL_END} <= banned
-
-    def test_answer_backtick_bans_think_start(self):
-        ids = [_THINK_END, 1, _SPACE_BACKTICK]
-        banned = set(banned_ids_for_request(ids, self._cfg()))
-        assert _THINK_START in banned
+        assert _THINK_END not in banned
         assert _IM_END in banned
 
-    def test_lone_backtick_bans_family_too(self):
-        banned = set(banned_ids_for_request([1, _BACKTICK], self._cfg()))
-        assert {_THINK_END, _TOOL_START} <= banned
+    def test_reasoning_backtick_allows_whole_family(self):
+        banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
+        assert banned.isdisjoint({_THINK_START, _THINK_END, _TOOL_START, _TOOL_END})
 
-    def test_family_ban_is_non_sticky(self):
-        # Control: one token later a legit </think> close is allowed again;
-        # only the reasoning-phase im_end ban remains.
+    def test_answer_backtick_allows_structural_ids(self):
+        ids = [_THINK_END, 1, _SPACE_BACKTICK]
+        assert banned_ids_for_request(ids, self._cfg()) == [_IM_END]
+
+    def test_lone_backtick_allows_family_too(self):
+        banned = set(banned_ids_for_request([1, _BACKTICK], self._cfg()))
+        assert banned.isdisjoint({_THINK_END, _TOOL_START})
+        assert _IM_END in banned
+
+    def test_im_end_ban_is_non_sticky(self):
+        # Control: one token later only the reasoning-phase im_end ban
+        # remains ([1, ...] is still mid-think).
         cfg = self._cfg()
         assert banned_ids_for_request([1, _SPACE_BACKTICK, 2], cfg) == [_IM_END]
 
@@ -325,8 +327,8 @@ class TestDanglingBacktick:
             backtick_id=_BACKTICK,
             fence_id=_FENCE,
         )
-        # The backtick rule fires mid-think too: a cited `</think>` there
-        # would close reasoning for real (structural family ban).
+        # The backtick rule itself still fires mid-think (im_end guard);
+        # structural ids are no longer banned by it.
         assert ends_with_dangling_backtick(
             ids,
             think_start_id=_THINK_START,

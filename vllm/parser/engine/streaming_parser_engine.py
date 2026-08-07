@@ -403,18 +403,29 @@ class StreamingParserEngine:
                 text = text.replace(lit, escaped)
         return text
 
-    def _escape_and_feed(self, text: str, *, escape: bool = True) -> str:
-        """Update markdown code state and optionally escape prose stretches.
+    @staticmethod
+    def _neutralize_tag_literals(text: str, literals: list[str]) -> str:
+        """Insert ZWSP after ``<`` so client tag scanners cannot match."""
+        for lit in literals:
+            if lit in text:
+                text = text.replace(lit, lit.replace("<", "<\u200b", 1))
+        return text
 
-        Structural tags inside `` `...` `` / ```...``` stay raw — HTML
-        entities are not interpreted in markdown code spans, so escaping
-        there produces visible ``&lt;think&gt;`` artifacts. Outside code,
-        tags are escaped for UI-safe prose when *escape* is True.
+    def _escape_and_feed(self, text: str, *, escape: bool = True) -> str:
+        """Update markdown code state and transform structural tag literals.
+
+        HTML entities are not interpreted in markdown code spans, so tags
+        inside `` `...` `` / ```...``` are ZWSP-neutralized instead of
+        escaped: rendering is identical, but raw-stream clients that
+        scan for tool markup before markdown rendering no longer eat the
+        citation (empty-block artifact). Outside code, tags are escaped
+        for UI-safe prose when *escape* is True and kept raw otherwise.
         """
         if not text:
             return ""
-        do_escape = escape and self.config.escape_structural_tags_in_prose
-        literals = self._structural_tag_literals() if do_escape else []
+        gate = self.config.escape_structural_tags_in_prose
+        do_escape = escape and gate
+        literals = self._structural_tag_literals() if gate else []
 
         out: list[str] = []
         seg: list[str] = []
@@ -425,7 +436,9 @@ class StreamingParserEngine:
                 return
             chunk = "".join(seg)
             seg.clear()
-            if literals and not self._in_markdown_code():
+            if literals and self._in_markdown_code():
+                chunk = self._neutralize_tag_literals(chunk, literals)
+            elif do_escape and literals:
                 chunk = self._escape_tag_literals(chunk, literals)
             out.append(chunk)
 
@@ -601,9 +614,13 @@ class StreamingParserEngine:
     def _is_false_think_end_continuation(cls, text: str) -> bool:
         """Whether text after ``</think>`` looks like mid-sentence prose.
 
-        Real answers commit the end when they start with an Uppercase letter
-        (or tool markup). Lowercase / punctuation / ``<|…|>`` prose means
-        the tag was *mentioned* inside reasoning — stay in think.
+        Missing a real think end swallows the whole answer into the
+        reasoning block (catastrophic); falsely closing on a citation
+        only misroutes a tail. So continuation requires explicit
+        evidence — cased-lowercase prose, a ``<|…|>``-style mention, or
+        closing/sentence punctuation. Everything else (Uppercase, CJK,
+        digits, markdown markup like ``#``/``-``/``*``/``>``, emoji)
+        commits the end.
         """
         if not text.strip():
             return True
@@ -611,25 +628,20 @@ class StreamingParserEngine:
         check = body.lstrip("\n") if body.startswith("\n") else text.lstrip()
         if not check:
             return True
-        # Uppercase starts a real answer. Leading '<' is usually still
-        # think prose (e.g. <|endoftext|>). Real tool markup commits the
-        # end; TOOL_START / FUNC_PREFIX terminals normally handle this,
-        # but keep the same rule if those tags arrive as plain text.
         first = check[0]
-        if first.isupper():
-            return False
+        # Real tool markup commits the end; TOOL_START / FUNC_PREFIX
+        # terminals normally handle this, but keep the same rule if
+        # those tags arrive as plain text.
         if check.startswith("<function=") or check.startswith("<tool_call"):
             return False
+        # Leading '<' is still think prose (e.g. <|endoftext|>).
         if first == "<":
             return True
-        if first in ",;:)]}'\"`":
+        # Closing or sentence punctuation: bare citation mid-sentence.
+        if first in ",;:)]}'\"`.?!":
             return True
         # Cased-lowercase continues the reasoning sentence.
-        if first.islower():
-            return True
-        # Caseless letters/digits (CJK, Hangul, Arabic numerals, …) have no
-        # uppercase form; they start real answers, not mid-sentence prose.
-        return not first.isalnum()
+        return first.islower()
 
     def _resolve_think_end_pending(self, text: str) -> list[SemanticEvent]:
         """Commit or abort a deferred ``</think>`` using following text."""
@@ -670,7 +682,10 @@ class StreamingParserEngine:
         if stripped.startswith("<tool_call") or stripped.startswith("<function="):
             events.extend(self._process_lex_tokens(self._lexer.feed(content)))
             return events
-        self._feed_markdown_state(content)
+        if self.skip_tool_parsing:
+            self._feed_markdown_state(content)
+        else:
+            content = self._escape_and_feed(content, escape=False)
         self._note_answer_content(content)
         events.append(
             SemanticEvent(
@@ -710,7 +725,15 @@ class StreamingParserEngine:
                 text = self._escape_and_feed(text)
                 self._note_reasoning_content(text)
             elif content_type == EventType.TEXT_CHUNK:
-                self._feed_markdown_state(text)
+                # No prose escaping in the answer, but code-span tag
+                # literals still get ZWSP-neutralized — unless this
+                # content is re-fed to a tool engine with the original
+                # token ids (skip_tool_parsing), where transforming
+                # would break the id/text anchoring of its scanner.
+                if self.skip_tool_parsing:
+                    self._feed_markdown_state(text)
+                else:
+                    text = self._escape_and_feed(text, escape=False)
                 if self.state == ParserState.CONTENT:
                     self._note_answer_content(text)
             return [SemanticEvent(content_type, value=text, tool_index=self.tool_index)]

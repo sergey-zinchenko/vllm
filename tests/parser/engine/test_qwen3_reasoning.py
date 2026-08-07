@@ -52,11 +52,19 @@ def _esc_tag(tag: str) -> str:
     return tag.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_ZWSP = "\u200b"
+
+
+def _zwsp_tag(tag: str) -> str:
+    """ZWSP-neutralized form emitted inside markdown code spans."""
+    return tag.replace("<", "<" + _ZWSP, 1)
+
+
 def _assert_tag_visible(text: str | None, tag: str) -> None:
-    """Tag must appear as raw or HTML-escaped prose (never silently dropped)."""
+    """Tag must appear as raw, escaped or ZWSP prose (never silently dropped)."""
     assert text is not None
-    assert tag in text or _esc_tag(tag) in text, (
-        f"expected {tag!r} (or escaped) in {text!r}"
+    assert tag in text or _esc_tag(tag) in text or _zwsp_tag(tag) in text, (
+        f"expected {tag!r} (raw/escaped/zwsp) in {text!r}"
     )
 
 
@@ -1072,6 +1080,8 @@ class TestMidReasoningCitations:
         assert content == "Answer."
 
     def test_code_span_cited_think_start_raw(self, parser):
+        # Inside backticks the tag is ZWSP-neutralized (never HTML-escaped):
+        # client-side tool-markup scanners must not match the raw literal.
         reasoning, _ = simulate_reasoning_streaming(
             parser,
             ["docs say `", "<think>", "` opens think. ", "</think>", "Done"],
@@ -1083,7 +1093,8 @@ class TestMidReasoningCitations:
                 (3,),
             ],
         )
-        assert "`<think>`" in reasoning
+        assert f"`{_zwsp_tag('<think>')}`" in reasoning
+        assert "<think>" not in reasoning
         assert "&lt;" not in reasoning
 
     def test_code_span_cited_think_end_raw(self, parser):
@@ -1097,7 +1108,24 @@ class TestMidReasoningCitations:
             ],
         )
         assert content == ""
-        assert "`</think>`" in reasoning
+        assert f"`{_zwsp_tag('</think>')}`" in reasoning
+        assert "</think>" not in reasoning
+        assert "&lt;" not in reasoning
+
+    def test_fenced_block_cited_tag_zwsp(self, parser):
+        reasoning, _ = simulate_reasoning_streaming(
+            parser,
+            ["example:\n```\n", "<tool_call>", "\n``` done. ", "</think>", "A"],
+            [
+                (1,),
+                (_TOOL_CALL_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert _zwsp_tag("<tool_call>") in reasoning
+        assert "<tool_call>" not in reasoning
         assert "&lt;" not in reasoning
 
     def test_leading_think_start_still_stripped(self, parser):
@@ -1148,6 +1176,96 @@ class TestMidReasoningCitations:
             ],
         )
         assert "`<|endoftext|>`" in reasoning
+
+
+class TestMarkdownAnswerAfterThinkEnd:
+    """Answers starting with markdown markup must commit ``</think>``.
+
+    Screenshot scenario: the answer opens with a raw markdown heading
+    («# Полный обзор: …») right after the real ``</think>`` id. The
+    false-continuation heuristic treated any non-alnum start as think
+    prose, so the whole answer rendered inside the reasoning block and
+    no content ever arrived. Missing a real think end is catastrophic
+    (answer swallowed); falsely closing on a citation only misroutes a
+    tail — so continuation must require explicit evidence.
+    """
+
+    @pytest.fixture
+    def parser(self, mock_tokenizer):
+        return Qwen3Parser(mock_tokenizer)
+
+    def _run(self, parser, answer_chunks):
+        chunks = ["Разбираю вопрос. ", "</think>", *answer_chunks]
+        ids = [(1,), (_THINK_END_ID,)] + [(100 + i,) for i in range(len(answer_chunks))]
+        return simulate_reasoning_streaming(parser, chunks, ids)
+
+    def test_heading_answer_goes_to_content(self, parser):
+        reasoning, content = self._run(
+            parser, ["\n\n# Полный обзор: сравнение подходов\n\nТекст."]
+        )
+        assert "# Полный обзор" in content
+        assert "</think>" not in reasoning
+        assert "# Полный обзор" not in reasoning
+
+    def test_heading_hash_as_own_token(self, parser):
+        # The heading marker arrives as its own tiny token.
+        reasoning, content = self._run(
+            parser, ["\n\n", "#", " Полный обзор", ": сравнение\n"]
+        )
+        assert "# Полный обзор" in content
+        assert "</think>" not in reasoning
+
+    def test_list_item_answer_goes_to_content(self, parser):
+        reasoning, content = self._run(parser, ["\n\n- пункт первый\n- второй\n"])
+        assert "- пункт первый" in content
+        assert "</think>" not in reasoning
+
+    def test_bold_answer_goes_to_content(self, parser):
+        reasoning, content = self._run(parser, ["\n\n**Жирный** старт ответа."])
+        assert "**Жирный**" in content
+        assert "</think>" not in reasoning
+
+    def test_blockquote_answer_goes_to_content(self, parser):
+        reasoning, content = self._run(parser, ["\n\n> цитата в начале ответа\n"])
+        assert "> цитата" in content
+        assert "</think>" not in reasoning
+
+    def test_control_code_span_citation_stays_reasoning(self, parser):
+        # GREEN control: `` `</think>` `` inside backticks is a citation.
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["tag `", "</think>", "` cited. ", "</think>", "Answer."],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert content == "Answer."
+        assert _zwsp_tag("</think>") in reasoning
+
+    def test_control_lowercase_continuation_stays_reasoning(self, parser):
+        # GREEN control: bare cited tag + lowercase tail continues think.
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["the ", "</think>", " tag ends it. ", "</think>", "Done."],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert content == "Done."
+        assert "tag ends it." in reasoning
+
+    def test_control_uppercase_answer_commits(self, parser):
+        reasoning, content = self._run(parser, ["Ответ начинается с заглавной."])
+        assert content == "Ответ начинается с заглавной."
+        assert "</think>" not in reasoning
 
 
 class TestWhitespaceStrippingDisabled:
@@ -1365,7 +1483,8 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert "`<tool_call>`" in out.reasoning
+        assert f"`{_zwsp_tag('<tool_call>')}`" in out.reasoning
+        assert "<tool_call>" not in out.reasoning
         assert self._CITE_PRE in out.reasoning
         assert '` as literal text"). ' in out.reasoning
         assert out.content == "Answer."
@@ -1384,7 +1503,8 @@ class TestToolTagCitationServing:
             chunk_size,
         )
         assert out.reasoning == "thinking. "
-        assert "`<tool_call>`" in out.content
+        assert f"`{_zwsp_tag('<tool_call>')}`" in out.content
+        assert "<tool_call>" not in out.content
         assert self._CITE_PRE in out.content
         assert "Tail continues." in out.content
         assert out.tool_calls == []
@@ -1419,7 +1539,8 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert "`<tool_call>`" in out.reasoning
+        assert f"`{_zwsp_tag('<tool_call>')}`" in out.reasoning
+        assert "<tool_call>" not in out.reasoning
         assert '` as literal text"). ' in out.reasoning
         assert out.content == "Answer."
         assert out.tool_calls == []
@@ -1436,6 +1557,7 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert "`<tool_call>`" in out.content
+        assert f"`{_zwsp_tag('<tool_call>')}`" in out.content
+        assert "<tool_call>" not in out.content
         assert "Tail continues." in out.content
         assert out.tool_calls == []

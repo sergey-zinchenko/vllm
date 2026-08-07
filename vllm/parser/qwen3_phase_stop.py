@@ -262,9 +262,9 @@ def ends_with_dangling_backtick(
     Matches the lone `` ` `` id and merged BPE forms (``" `"``, ``"(`"``
     ...) whose text ends with exactly one backtick — prose openings almost
     never tokenize as the bare backtick, and the truncation happens right
-    after those merged forms. Applies inside reasoning too: the model
-    cites `` `</think>` `` mid-think, and only the structural-id ban keeps
-    the real special token from closing the block mid-citation.
+    after those merged forms. Applies inside reasoning too (im_end guard
+    only; cited structural ids stay sampleable and the parser keeps them
+    inert inside markdown code).
 
     Deliberately **not** span parity: counting one vocab id sees only one
     side of real inline spans, sticks odd, and bans ``im_end`` for the
@@ -328,25 +328,29 @@ def step_banned_ids(
 ) -> list[int]:
     """Token ids banned for the next decode step.
 
-    Two independent rules compose:
-    - reasoning phase: ``im_end`` banned while inside the think block;
-    - dangling backtick: the whole structural family (``im_end`` + think
-      and tool tags) banned for exactly one step after an opening
-      `` ` ``, so a cited special token must be spelled as plain text
-      instead of emitted as the real id (which closes reasoning or ends
-      the message mid-citation).
+    Two independent rules compose, both banning only ``im_end``:
+    - reasoning phase: banned while inside the think block;
+    - dangling backtick: banned for exactly one step after an opening
+      `` ` `` (stop right after an opening backtick truncates the
+      citation).
+
+    Structural think/tool ids are deliberately **not** banned after a
+    backtick: cited special ids inside backticks are legal — the parser's
+    markdown-code inert rule keeps them raw prose. Banning them knocked
+    the model off its citation path mid-sentence (bail into newline +
+    early ``</think>``, tail of the sentence lost).
     """
     banned: list[int] = []
-    if im_end_id is not None and is_in_reasoning_or_tool_phase(
+    if im_end_id is None:
+        return banned
+    if is_in_reasoning_or_tool_phase(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
         tool_start_id=tool_start_id,
         tool_end_id=tool_end_id,
         initial_reasoning=initial_reasoning,
-    ):
-        banned.append(im_end_id)
-    if ends_with_dangling_backtick(
+    ) or ends_with_dangling_backtick(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
@@ -355,15 +359,7 @@ def step_banned_ids(
         initial_reasoning=initial_reasoning,
         trailing_backtick_ids=trailing_backtick_ids,
     ):
-        for tid in (
-            im_end_id,
-            think_start_id,
-            think_end_id,
-            tool_start_id,
-            tool_end_id,
-        ):
-            if tid is not None and tid not in banned:
-                banned.append(tid)
+        banned.append(im_end_id)
     return banned
 
 
