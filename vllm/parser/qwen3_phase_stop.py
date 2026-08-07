@@ -7,9 +7,10 @@ Product invariants:
    ``im_end`` / max_tokens / tool end).
 2. ``<|im_end|>`` is phase-aware: banned while the accepted output is still
    in REASONING; allowed once ``</think>`` has closed think.
-3. After think closes, ``im_end`` is also banned while single-backtick
-   token parity is odd (unclosed inline `` `...` ``) so the model cannot
-   stop mid-span after an opening backtick.
+3. After think closes, ``im_end`` is also banned for the single step where
+   the previous token is a lone `` ` `` (stop right after an opening
+   backtick). This is a non-sticky logits nudge only: it never affects
+   ``check_stop``, and any non-backtick token re-allows ``im_end``.
 
 Open ``<tool_call>`` regions intentionally do **not** ban ``im_end``.
 Models often cite ``<tool_call>`` as prose in the answer phase without a
@@ -198,7 +199,7 @@ def is_in_reasoning_or_tool_phase(
     return in_reasoning
 
 
-def has_open_inline_backtick(
+def ends_with_dangling_backtick(
     output_token_ids: Sequence[int],
     *,
     think_start_id: int | None,
@@ -207,32 +208,29 @@ def has_open_inline_backtick(
     fence_id: int | None = None,
     initial_reasoning: bool = True,
 ) -> bool:
-    """True when answer-phase single-backtick token parity is odd.
+    """True when the last answer-phase token is a lone `` ` `` token.
 
-    Counts only after the latest ``think_end`` (while not in reasoning).
-    The fence token `` ``` `` is ignored so it does not toggle thrice.
+    Deliberately **not** span parity: BPE merges backticks with neighbors
+    (``" `"``, ``"`,"``, ``"``"`` ...), so counting one vocab id sees only
+    one side of real inline spans. A parity rule sticks odd and bans
+    ``im_end`` for the rest of the request (endless ``!!!`` tails,
+    rewritten endings under MTP). Checking only the immediately preceding
+    token blocks the observed "stop right after opening backtick" pattern
+    while staying non-sticky: any other token re-allows ``im_end``.
     """
-    if backtick_id is None:
+    del fence_id
+    if backtick_id is None or not output_token_ids:
         return False
-
-    in_reasoning = initial_reasoning
-    parity = 0
-    for tid in output_token_ids:
-        if think_start_id is not None and tid == think_start_id:
-            in_reasoning = True
-            parity = 0
-            continue
-        if think_end_id is not None and tid == think_end_id:
-            in_reasoning = False
-            parity = 0
-            continue
-        if in_reasoning:
-            continue
-        if fence_id is not None and tid == fence_id:
-            continue
-        if tid == backtick_id:
-            parity ^= 1
-    return parity == 1
+    if output_token_ids[-1] != backtick_id:
+        return False
+    return not is_in_reasoning_or_tool_phase(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        tool_start_id=None,
+        tool_end_id=None,
+        initial_reasoning=initial_reasoning,
+    )
 
 
 def should_ban_im_end(
@@ -256,7 +254,7 @@ def should_ban_im_end(
         initial_reasoning=initial_reasoning,
     ):
         return True
-    return has_open_inline_backtick(
+    return ends_with_dangling_backtick(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
@@ -351,7 +349,14 @@ def should_ignore_stop_token(
     output_token_ids_before: Sequence[int],
     extra_args: Mapping[str, Any] | None,
 ) -> bool:
-    """Return True if *token_id* is a phase-banned stop (e.g. mid-think im_end)."""
+    """Return True if *token_id* is a mid-think ``im_end`` stop.
+
+    Only the reasoning phase ignores a sampled ``im_end``. The dangling
+    backtick rule is deliberately excluded: once ``im_end`` is sampled we
+    cannot rewrite history, and ignoring it makes generation run past the
+    intended end (model writes a new tail, tries to stop again, gets
+    ignored again — visible as rewritten endings in the client).
+    """
     cfg = parse_phase_ban_config(extra_args)
     if cfg is None:
         return False
@@ -362,18 +367,16 @@ def should_ignore_stop_token(
         tool_start,
         tool_end,
         initial,
-        backtick_id,
-        fence_id,
+        _backtick_id,
+        _fence_id,
     ) = cfg
     if token_id != im_end_id:
         return False
-    return should_ban_im_end(
+    return is_in_reasoning_or_tool_phase(
         output_token_ids_before,
         think_start_id=think_start,
         think_end_id=think_end,
         tool_start_id=tool_start,
         tool_end_id=tool_end,
         initial_reasoning=initial,
-        backtick_id=backtick_id,
-        fence_id=fence_id,
     )

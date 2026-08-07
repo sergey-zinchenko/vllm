@@ -10,7 +10,7 @@ from vllm.parser.qwen3_phase_stop import (
     QWEN_IM_END,
     apply_endoftext_ban_to_request,
     banned_ids_for_request,
-    has_open_inline_backtick,
+    ends_with_dangling_backtick,
     is_in_reasoning_or_tool_phase,
     parse_phase_ban_config,
     should_ban_im_end,
@@ -94,10 +94,14 @@ class TestPhaseDetection:
         )
 
 
-class TestInlineBacktickParity:
-    def test_odd_backtick_after_think_end_bans_im_end(self):
-        ids = [_THINK_END, 1, _BACKTICK, 2]
-        assert has_open_inline_backtick(
+class TestDanglingBacktick:
+    """The im_end ban must be non-sticky: only the single step right after
+    a lone `` ` `` token blocks stop. Parity counting deadlocks (BPE merges
+    hide one side of real spans) and caused endless ``!!!`` tails."""
+
+    def test_last_token_backtick_bans_im_end(self):
+        ids = [_THINK_END, 1, _BACKTICK]
+        assert ends_with_dangling_backtick(
             ids,
             think_start_id=_THINK_START,
             think_end_id=_THINK_END,
@@ -116,9 +120,11 @@ class TestInlineBacktickParity:
             fence_id=_FENCE,
         )
 
-    def test_even_backtick_after_think_end_allows_im_end(self):
-        ids = [_THINK_END, 1, _BACKTICK, 2, _BACKTICK]
-        assert not has_open_inline_backtick(
+    def test_unpaired_backtick_earlier_does_not_stick(self):
+        # Regression: odd count deep in the answer must NOT keep im_end
+        # banned once any other token followed (no parity deadlock).
+        ids = [_THINK_END, 1, _BACKTICK, 2]
+        assert not ends_with_dangling_backtick(
             ids,
             think_start_id=_THINK_START,
             think_end_id=_THINK_END,
@@ -149,8 +155,8 @@ class TestInlineBacktickParity:
             backtick_id=_BACKTICK,
             fence_id=_FENCE,
         )
-        # Backticks inside think do not open answer-phase parity.
-        assert not has_open_inline_backtick(
+        # Backtick at the end of think content is not an answer-phase rule.
+        assert not ends_with_dangling_backtick(
             ids,
             think_start_id=_THINK_START,
             think_end_id=_THINK_END,
@@ -159,10 +165,20 @@ class TestInlineBacktickParity:
             initial_reasoning=True,
         )
 
-    def test_fence_token_does_not_toggle_parity(self):
-        ids = [_THINK_END, _FENCE, 1, _FENCE]
-        assert not has_open_inline_backtick(
+    def test_fence_token_does_not_ban(self):
+        ids = [_THINK_END, 1, _FENCE]
+        assert not ends_with_dangling_backtick(
             ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+            initial_reasoning=False,
+        )
+
+    def test_empty_output_does_not_ban(self):
+        assert not ends_with_dangling_backtick(
+            [],
             think_start_id=_THINK_START,
             think_end_id=_THINK_END,
             backtick_id=_BACKTICK,
@@ -244,7 +260,7 @@ class TestRequestWiring:
         assert banned_ids_for_request([1, 2], extra) == [_IM_END]
         assert banned_ids_for_request([_THINK_END, 3], extra) == []
 
-    def test_banned_ids_for_request_odd_backtick_parity(self):
+    def test_banned_ids_for_request_dangling_backtick(self):
         extra = {
             PHASE_BAN_XARG_KEY: [
                 _IM_END,
@@ -258,11 +274,16 @@ class TestRequestWiring:
             ]
         }
         assert banned_ids_for_request([_THINK_END, _BACKTICK], extra) == [_IM_END]
-        assert (
-            banned_ids_for_request([_THINK_END, _BACKTICK, 1, _BACKTICK], extra) == []
-        )
+        # Non-sticky: any token after the backtick re-allows im_end.
+        assert banned_ids_for_request([_THINK_END, _BACKTICK, 1], extra) == []
 
-    def test_should_ignore_stop_token(self):
+    def test_should_ignore_stop_token_reasoning_only(self):
+        """A sampled im_end is ignored only mid-think, never for backticks.
+
+        Ignoring a real im_end in the answer phase makes generation run
+        past the end (rewritten-tail artifact) — history cannot be
+        rewritten once the token is sampled.
+        """
         extra = {
             PHASE_BAN_XARG_KEY: [
                 _IM_END,
@@ -277,5 +298,5 @@ class TestRequestWiring:
         }
         assert should_ignore_stop_token(_IM_END, [1, 2], extra)
         assert not should_ignore_stop_token(_IM_END, [_THINK_END], extra)
-        assert should_ignore_stop_token(_IM_END, [_THINK_END, _BACKTICK], extra)
+        assert not should_ignore_stop_token(_IM_END, [_THINK_END, _BACKTICK], extra)
         assert not should_ignore_stop_token(999, [1, 2], extra)
