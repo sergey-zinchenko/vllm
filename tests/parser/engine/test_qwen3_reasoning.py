@@ -1024,6 +1024,123 @@ class TestMarkdownInertStructuralTags:
         assert "<function=" not in collect_content(results)
 
 
+class TestMidReasoningCitations:
+    """Cited think tags mid-reasoning must never leave holes.
+
+    Screenshot scenario: reasoning discusses the think tags themselves
+    ("the issue where `<think>` appears inside the reasoning block").
+    A cited ``<think>`` special id mid-think was silently absorbed by the
+    leading-strip transition — the sentence renders with a hole / empty
+    markdown code span. Inside backticks the tag must also stay raw:
+    HTML entities are not interpreted within markdown code spans.
+    """
+
+    @pytest.fixture
+    def parser(self, mock_tokenizer):
+        return Qwen3Parser(mock_tokenizer)
+
+    def test_bare_cited_think_start_visible(self, parser):
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["issue where ", "<think>", " appears. ", "</think>", "Answer."],
+            [
+                (1,),
+                (_THINK_START_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        _assert_tag_visible(reasoning, "<think>")
+        assert "issue where" in reasoning
+        assert "appears." in reasoning
+        assert content == "Answer."
+
+    def test_bare_cited_think_start_visible_nonstreaming(self, parser):
+        text = "<think>issue where <think> appears.</think>Answer."
+        reasoning, content = parser.extract_reasoning(text, None)
+        _assert_tag_visible(reasoning, "<think>")
+        assert content == "Answer."
+
+    def test_code_span_cited_think_start_raw(self, parser):
+        reasoning, _ = simulate_reasoning_streaming(
+            parser,
+            ["docs say `", "<think>", "` opens think. ", "</think>", "Done"],
+            [
+                (1,),
+                (_THINK_START_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert "`<think>`" in reasoning
+        assert "&lt;" not in reasoning
+
+    def test_code_span_cited_think_end_raw(self, parser):
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["docs say `", "</think>", "` closes think."],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+            ],
+        )
+        assert content == ""
+        assert "`</think>`" in reasoning
+        assert "&lt;" not in reasoning
+
+    def test_leading_think_start_still_stripped(self, parser):
+        # Control: the legit template <think> prefix never becomes text.
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["<think>", "thinking. ", "</think>", "Done"],
+            [
+                (_THINK_START_ID,),
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+            ],
+        )
+        assert reasoning == "thinking. "
+        assert content == "Done"
+
+    def test_real_think_end_still_ends_reasoning(self, parser):
+        # Control: a genuine close after a cited tag still switches phase.
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["cite `", "<think>", "` here. ", "</think>", "Answer"],
+            [
+                (1,),
+                (_THINK_START_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert content == "Answer"
+        assert "</think>" not in reasoning
+
+    def test_endoftext_text_cite_in_code_span_intact(self, mock_tokenizer):
+        # Control: non-terminal specials cited as text pass through raw.
+        vocab = dict(_QWEN3_VOCAB)
+        vocab["<|endoftext|>"] = 70
+        parser = Qwen3Parser(make_mock_tokenizer(vocab))
+        reasoning, _ = simulate_reasoning_streaming(
+            parser,
+            ["issue where `", "<|endoftext|>", "` appears. ", "</think>", "A"],
+            [
+                (1,),
+                (2,),
+                (3,),
+                (_THINK_END_ID,),
+                (4,),
+            ],
+        )
+        assert "`<|endoftext|>`" in reasoning
+
+
 class TestWhitespaceStrippingDisabled:
     """When strip_trailing_reasoning_whitespace is False,
     trailing whitespace in reasoning must be preserved."""

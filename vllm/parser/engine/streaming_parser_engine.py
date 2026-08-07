@@ -191,6 +191,10 @@ class StreamingParserEngine:
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
         self._answer_content_started = False
+        # True after the first non-whitespace REASONING_CHUNK. Distinguishes
+        # the template leading ``<think>`` (still stripped) from a mid-think
+        # citation of the same special id (kept as prose).
+        self._reasoning_content_started = False
         # True when TOOL_PREAMBLE was entered from THINK_END_PENDING; real
         # REASONING_END waits for <function=, prose abort returns to reasoning.
         self._reasoning_end_before_tool = False
@@ -381,46 +385,16 @@ class StreamingParserEngine:
         lit = self.config.terminals.get(terminal, "")
         return bool(lit) and "<" in lit
 
-    def _feed_markdown_state(self, text: str) -> None:
-        """Update inline-backtick / fenced-code state from emitted text.
-
-        Inline spans do not survive newlines: a dangling `` ` `` must not
-        keep suppressing ``</think>`` / tool terminals on the next line.
-        Fenced ``` blocks are unchanged.
-        """
-        if not text:
-            return
-        i = 0
-        n = len(text)
-        while i < n:
-            if text.startswith("```", i):
-                self._md_in_fence = not self._md_in_fence
-                if self._md_in_fence:
-                    self._md_inline_odd = False
-                i += 3
-                continue
-            if not self._md_in_fence and text[i] == "`":
-                self._md_inline_odd = not self._md_inline_odd
-                i += 1
-                continue
-            if not self._md_in_fence and self._md_inline_odd and text[i] == "\n":
-                self._md_inline_odd = False
-                i += 1
-                continue
-            i += 1
-
-    def _escape_prose_text(self, text: str) -> str:
-        """HTML-escape known structural tag literals for UI-safe prose."""
-        if not text or not self.config.escape_structural_tags_in_prose:
-            return text
-        # Only tag-like literals (must contain ``<``). Skip bare ``>`` /
-        # other punctuation terminals so prose like ``<|im_end|>`` is intact
-        # except for known structural tags.
-        literals = sorted(
+    def _structural_tag_literals(self) -> list[str]:
+        """Tag-like terminal literals, longest first (for safe replace)."""
+        return sorted(
             (lit for lit in self.config.terminals.values() if lit and "<" in lit),
             key=len,
             reverse=True,
         )
+
+    @staticmethod
+    def _escape_tag_literals(text: str, literals: list[str]) -> str:
         for lit in literals:
             if lit in text:
                 escaped = (
@@ -428,6 +402,68 @@ class StreamingParserEngine:
                 )
                 text = text.replace(lit, escaped)
         return text
+
+    def _escape_and_feed(self, text: str, *, escape: bool = True) -> str:
+        """Update markdown code state and optionally escape prose stretches.
+
+        Structural tags inside `` `...` `` / ```...``` stay raw — HTML
+        entities are not interpreted in markdown code spans, so escaping
+        there produces visible ``&lt;think&gt;`` artifacts. Outside code,
+        tags are escaped for UI-safe prose when *escape* is True.
+        """
+        if not text:
+            return ""
+        do_escape = escape and self.config.escape_structural_tags_in_prose
+        literals = self._structural_tag_literals() if do_escape else []
+
+        out: list[str] = []
+        seg: list[str] = []
+
+        def flush_seg() -> None:
+            """Flush *seg* under the current (pre-toggle) code state."""
+            if not seg:
+                return
+            chunk = "".join(seg)
+            seg.clear()
+            if literals and not self._in_markdown_code():
+                chunk = self._escape_tag_literals(chunk, literals)
+            out.append(chunk)
+
+        i = 0
+        n = len(text)
+        while i < n:
+            if text.startswith("```", i):
+                flush_seg()
+                self._md_in_fence = not self._md_in_fence
+                if self._md_in_fence:
+                    self._md_inline_odd = False
+                out.append("```")
+                i += 3
+                continue
+            if not self._md_in_fence and text[i] == "`":
+                flush_seg()
+                self._md_inline_odd = not self._md_inline_odd
+                out.append("`")
+                i += 1
+                continue
+            if not self._md_in_fence and self._md_inline_odd and text[i] == "\n":
+                # Dangling inline span ends at newline; content stays raw.
+                if seg:
+                    out.append("".join(seg))
+                    seg.clear()
+                self._md_inline_odd = False
+                out.append("\n")
+                i += 1
+                continue
+            seg.append(text[i])
+            i += 1
+
+        flush_seg()
+        return "".join(out)
+
+    def _feed_markdown_state(self, text: str) -> None:
+        """Update inline-backtick / fenced-code state from emitted text."""
+        self._escape_and_feed(text, escape=False)
 
     def _on_terminal(self, terminal: str, value: str) -> list[SemanticEvent]:
         key = (self.state, terminal)
@@ -439,6 +475,19 @@ class StreamingParserEngine:
 
         # Inside markdown code: all structural tags are inert prose.
         if self._in_markdown_code() and self._is_structural_terminal(terminal):
+            return self._emit_for_state(text)
+
+        # Mid-reasoning cited ``<think>``: the no-event self-loop strips the
+        # leading template tag, but once think content has started the same
+        # id is a citation — keep it as visible prose (else empty holes).
+        if (
+            transition is not None
+            and self.state == ParserState.REASONING
+            and terminal == "THINK_START"
+            and not transition.events
+            and transition.next_state == ParserState.REASONING
+            and self._reasoning_content_started
+        ):
             return self._emit_for_state(text)
 
         if transition is None:
@@ -499,6 +548,10 @@ class StreamingParserEngine:
         if text.strip():
             self._answer_content_started = True
 
+    def _note_reasoning_content(self, text: str) -> None:
+        if text.strip():
+            self._reasoning_content_started = True
+
     def _flush_tool_preamble_as_text(self, extra: str = "") -> list[SemanticEvent]:
         """Abort an unconfirmed tool preamble back to ordinary text.
 
@@ -519,10 +572,10 @@ class StreamingParserEngine:
             self._reasoning_end_before_tool = False
             self.state = ParserState.REASONING
             raw = f"{marker}{think_ws}{preamble}"
-            self._feed_markdown_state(raw)
-            text = self._escape_prose_text(raw)
+            text = self._escape_and_feed(raw)
             if not text:
                 return []
+            self._note_reasoning_content(text)
             return [
                 SemanticEvent(
                     EventType.REASONING_CHUNK,
@@ -587,11 +640,12 @@ class StreamingParserEngine:
         if self._is_false_think_end_continuation(text):
             self.state = ParserState.REASONING
             raw = f"{marker}{buffered}{text}"
-            self._feed_markdown_state(raw)
+            value = self._escape_and_feed(raw)
+            self._note_reasoning_content(value)
             return [
                 SemanticEvent(
                     EventType.REASONING_CHUNK,
-                    value=self._escape_prose_text(raw),
+                    value=value,
                     tool_index=self.tool_index,
                 )
             ]
@@ -647,15 +701,13 @@ class StreamingParserEngine:
             ]
         content_type = self.config.content_events.get(self.state)
         if content_type is not None:
-            if content_type in (EventType.REASONING_CHUNK, EventType.TEXT_CHUNK):
-                self._feed_markdown_state(text)
             if content_type == EventType.REASONING_CHUNK:
-                text = self._escape_prose_text(text)
-            if (
-                content_type == EventType.TEXT_CHUNK
-                and self.state == ParserState.CONTENT
-            ):
-                self._note_answer_content(text)
+                text = self._escape_and_feed(text)
+                self._note_reasoning_content(text)
+            elif content_type == EventType.TEXT_CHUNK:
+                self._feed_markdown_state(text)
+                if self.state == ParserState.CONTENT:
+                    self._note_answer_content(text)
             return [SemanticEvent(content_type, value=text, tool_index=self.tool_index)]
         return []
 
