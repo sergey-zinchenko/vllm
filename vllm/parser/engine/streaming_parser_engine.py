@@ -615,16 +615,21 @@ class StreamingParserEngine:
         # think prose (e.g. <|endoftext|>). Real tool markup commits the
         # end; TOOL_START / FUNC_PREFIX terminals normally handle this,
         # but keep the same rule if those tags arrive as plain text.
-        if check[0].isupper():
+        first = check[0]
+        if first.isupper():
             return False
         if check.startswith("<function=") or check.startswith("<tool_call"):
             return False
-        if check[0] == "<":
+        if first == "<":
             return True
-        if check[0] in ",;:)]}'\"`":
+        if first in ",;:)]}'\"`":
             return True
-        # Lowercase (and any other non-answer start) continues reasoning.
-        return True
+        # Cased-lowercase continues the reasoning sentence.
+        if first.islower():
+            return True
+        # Caseless letters/digits (CJK, Hangul, Arabic numerals, …) have no
+        # uppercase form; they start real answers, not mid-sentence prose.
+        return not first.isalnum()
 
     def _resolve_think_end_pending(self, text: str) -> list[SemanticEvent]:
         """Commit or abort a deferred ``</think>`` using following text."""

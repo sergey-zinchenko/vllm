@@ -15,6 +15,15 @@ import dataclasses
 import pytest
 
 from tests.parser.engine.conftest import make_mock_tokenizer
+from tests.parser.engine.replay_harness import (
+    CHUNK_SIZES,
+    DUMMY_TOOLS,
+    collect_output,
+    replay_streaming,
+)
+from tests.parser.engine.replay_harness import (
+    MockTokenizer as ReplayMockTokenizer,
+)
 from tests.parser.engine.streaming_helpers import simulate_reasoning_streaming
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.parser.engine.parser_engine_config import ParserState
@@ -1317,3 +1326,116 @@ class TestDelegatingParserNoToolContentLeak:
         assert "<function=" not in content
         assert "<parameter=" not in content
         assert "</function>" not in content
+
+
+class TestToolTagCitationServing:
+    """Serving-level contract: cited ``<tool_call>`` never swallows text.
+
+    Screenshot scenario ('PR #35687 ("Treat `<tool_call>` ...' holes in
+    both sections): the citation plus the whole tail vanished client-side.
+    Pin the server behavior — through ``DelegatingParser.parse_delta``
+    with tools enabled, citations (special-id and text form, reasoning
+    and answer phase) stream through intact and emit no tool_calls.
+    """
+
+    _CITE_PRE = 'PR #35687 ("Treat `'
+    _CITE_POST = '` as literal text"). '
+
+    def _replay(self, tokens, chunk_size):
+        tokenizer = ReplayMockTokenizer(dict(_QWEN3_VOCAB), tokens)
+        parser = _Qwen3DelegatingParser(tokenizer, tools=DUMMY_TOOLS)
+        deltas = replay_streaming(
+            parser,
+            tokens,
+            chunk_size=chunk_size,
+            finished_on_last=True,
+            tools=DUMMY_TOOLS,
+        )
+        return collect_output(deltas)
+
+    @pytest.mark.parametrize("chunk_size", CHUNK_SIZES, ids=lambda c: f"chunk={c}")
+    def test_special_id_citation_in_reasoning_code_span(self, chunk_size):
+        out = self._replay(
+            [
+                (100, self._CITE_PRE),
+                (_TOOL_CALL_ID, "<tool_call>"),
+                (101, self._CITE_POST),
+                (_THINK_END_ID, "</think>"),
+                (102, "Answer."),
+            ],
+            chunk_size,
+        )
+        assert "`<tool_call>`" in out.reasoning
+        assert self._CITE_PRE in out.reasoning
+        assert '` as literal text"). ' in out.reasoning
+        assert out.content == "Answer."
+        assert out.tool_calls == []
+
+    @pytest.mark.parametrize("chunk_size", CHUNK_SIZES, ids=lambda c: f"chunk={c}")
+    def test_special_id_citation_in_answer_code_span(self, chunk_size):
+        out = self._replay(
+            [
+                (100, "thinking. "),
+                (_THINK_END_ID, "</think>"),
+                (101, self._CITE_PRE),
+                (_TOOL_CALL_ID, "<tool_call>"),
+                (102, self._CITE_POST + "Tail continues."),
+            ],
+            chunk_size,
+        )
+        assert out.reasoning == "thinking. "
+        assert "`<tool_call>`" in out.content
+        assert self._CITE_PRE in out.content
+        assert "Tail continues." in out.content
+        assert out.tool_calls == []
+
+    @pytest.mark.parametrize("chunk_size", CHUNK_SIZES, ids=lambda c: f"chunk={c}")
+    def test_special_id_citation_in_answer_prose_keeps_tail(self, chunk_size):
+        out = self._replay(
+            [
+                (100, "thinking. "),
+                (_THINK_END_ID, "</think>"),
+                (101, "Treat "),
+                (_TOOL_CALL_ID, "<tool_call>"),
+                (102, " as text (tail preserved)."),
+            ],
+            chunk_size,
+        )
+        _assert_tag_visible(out.content, "<tool_call>")
+        assert "Treat " in out.content
+        assert "as text (tail preserved)." in out.content
+        assert out.tool_calls == []
+
+    @pytest.mark.parametrize("chunk_size", CHUNK_SIZES, ids=lambda c: f"chunk={c}")
+    def test_text_form_citation_in_reasoning_code_span(self, chunk_size):
+        # Tag arrives as plain BPE text (non-special id), not the special id.
+        out = self._replay(
+            [
+                (100, self._CITE_PRE),
+                (103, "<tool_call>"),
+                (101, self._CITE_POST),
+                (_THINK_END_ID, "</think>"),
+                (102, "Answer."),
+            ],
+            chunk_size,
+        )
+        assert "`<tool_call>`" in out.reasoning
+        assert '` as literal text"). ' in out.reasoning
+        assert out.content == "Answer."
+        assert out.tool_calls == []
+
+    @pytest.mark.parametrize("chunk_size", CHUNK_SIZES, ids=lambda c: f"chunk={c}")
+    def test_text_form_citation_in_answer_code_span(self, chunk_size):
+        out = self._replay(
+            [
+                (100, "thinking. "),
+                (_THINK_END_ID, "</think>"),
+                (101, self._CITE_PRE),
+                (103, "<tool_call>"),
+                (102, self._CITE_POST + "Tail continues."),
+            ],
+            chunk_size,
+        )
+        assert "`<tool_call>`" in out.content
+        assert "Tail continues." in out.content
+        assert out.tool_calls == []
