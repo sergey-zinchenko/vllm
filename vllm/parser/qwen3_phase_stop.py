@@ -46,8 +46,9 @@ _FENCE_BACKTICK = "```"
 # Flattened SamplingParams.extra_args / vllm_xargs key.
 # Values: [im_end_id, think_start_id, think_end_id, tool_start_id,
 #          tool_end_id, initial_reasoning (0/1),
-#          backtick_id?, fence_id?] — missing ids are -1.
-# Trailing fields are optional for backward-compatible parse.
+#          backtick_id?, fence_id?, *trailing_backtick_ids] — missing ids
+# are -1. Trailing fields are optional for backward-compatible parse;
+# indices 8+ are merged BPE tokens whose text ends with one backtick.
 PHASE_BAN_XARG_KEY = "qwen3_phase_ban"
 
 PhaseBanConfig = tuple[
@@ -59,7 +60,40 @@ PhaseBanConfig = tuple[
     bool,
     int | None,
     int | None,
+    frozenset[int],
 ]
+
+# One vocab scan per tokenizer: cache keyed by caller-provided identity
+# (vocab dicts are recreated per parser instance, tokenizers are not).
+_TRAILING_BACKTICK_CACHE: dict[tuple[int, int], list[int]] = {}
+
+
+def trailing_backtick_token_ids(
+    vocab: Mapping[str, int],
+    *,
+    cache_key: int | None = None,
+) -> list[int]:
+    """Vocab ids whose token text ends with exactly one `` ` ``.
+
+    Prose opening backticks arrive as merged BPE tokens (``" `"`` /
+    ``"Ġ`"``, ``"(`"`` ...), not as the lone `` ` `` id. Tokens ending in
+    ``` `` ``` are fence-ish closers and excluded (stop after them is
+    legit). The lone `` ` `` itself is excluded — it travels as the
+    dedicated config field.
+    """
+    if cache_key is not None:
+        key = (cache_key, len(vocab))
+        cached = _TRAILING_BACKTICK_CACHE.get(key)
+        if cached is not None:
+            return cached
+    ids = sorted(
+        tid
+        for tok, tid in vocab.items()
+        if tok != "`" and tok.endswith("`") and not tok.endswith("``")
+    )
+    if cache_key is not None:
+        _TRAILING_BACKTICK_CACHE[(cache_key, len(vocab))] = ids
+    return ids
 
 
 def resolve_vocab_token_id(vocab: Mapping[str, int], token: str) -> int | None:
@@ -85,6 +119,7 @@ def apply_endoftext_ban_to_request(
     tool_start: str = _TOOL_START,
     tool_end: str = _TOOL_END,
     initial_reasoning: bool = True,
+    vocab_cache_key: int | None = None,
 ) -> None:
     """Ban ``<|endoftext|>`` and enable phase-aware ``im_end`` bans.
 
@@ -123,6 +158,7 @@ def apply_endoftext_ban_to_request(
         1 if initial_reasoning else 0,
         _id(_INLINE_BACKTICK),
         _id(_FENCE_BACKTICK),
+        *trailing_backtick_token_ids(vocab, cache_key=vocab_cache_key),
     ]
     xargs = getattr(request, "vllm_xargs", None)
     if xargs is None:
@@ -138,8 +174,9 @@ def parse_phase_ban_config(
     """Parse flattened ``qwen3_phase_ban`` from SamplingParams.extra_args.
 
     Returns ``(im_end_id, think_start, think_end, tool_start, tool_end,
-    initial_reasoning, backtick_id, fence_id)`` or ``None`` if
-    unset/invalid. Trailing backtick/fence fields are optional.
+    initial_reasoning, backtick_id, fence_id, trailing_backtick_ids)`` or
+    ``None`` if unset/invalid. Fields past index 5 are optional; legacy
+    shorter configs parse with ``None`` / empty tail.
     """
     if not extra_args:
         return None
@@ -156,6 +193,7 @@ def parse_phase_ban_config(
 
     backtick_id = _opt(raw[6]) if len(raw) > 6 else None
     fence_id = _opt(raw[7]) if len(raw) > 7 else None
+    trailing = frozenset(int(v) for v in raw[8:] if int(v) >= 0)
     return (
         im_end_id,
         _opt(raw[1]),
@@ -165,6 +203,7 @@ def parse_phase_ban_config(
         bool(int(raw[5])),
         backtick_id,
         fence_id,
+        trailing,
     )
 
 
@@ -216,21 +255,27 @@ def ends_with_dangling_backtick(
     backtick_id: int | None,
     fence_id: int | None = None,
     initial_reasoning: bool = True,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
 ) -> bool:
-    """True when the last answer-phase token is a lone `` ` `` token.
+    """True when the last answer-phase token ends with an opening `` ` ``.
 
-    Deliberately **not** span parity: BPE merges backticks with neighbors
-    (``" `"``, ``"`,"``, ``"``"`` ...), so counting one vocab id sees only
-    one side of real inline spans. A parity rule sticks odd and bans
-    ``im_end`` for the rest of the request (endless ``!!!`` tails,
-    rewritten endings under MTP). Checking only the immediately preceding
-    token blocks the observed "stop right after opening backtick" pattern
-    while staying non-sticky: any other token re-allows ``im_end``.
+    Matches the lone `` ` `` id and merged BPE forms (``" `"``, ``"(`"``
+    ...) whose text ends with exactly one backtick — prose openings almost
+    never tokenize as the bare backtick, and the truncation happens right
+    after those merged forms.
+
+    Deliberately **not** span parity: counting one vocab id sees only one
+    side of real inline spans, sticks odd, and bans ``im_end`` for the
+    rest of the request (endless ``!!!`` tails, rewritten endings under
+    MTP). Checking only the immediately preceding token blocks the "stop
+    right after opening backtick" pattern while staying non-sticky: any
+    other token re-allows ``im_end``.
     """
     del fence_id
-    if backtick_id is None or not output_token_ids:
+    if not output_token_ids:
         return False
-    if output_token_ids[-1] != backtick_id:
+    last = output_token_ids[-1]
+    if last != backtick_id and last not in trailing_backtick_ids:
         return False
     return not is_in_reasoning_or_tool_phase(
         output_token_ids,
@@ -252,6 +297,7 @@ def should_ban_im_end(
     initial_reasoning: bool = True,
     backtick_id: int | None = None,
     fence_id: int | None = None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
 ) -> bool:
     """True when ``im_end`` must be banned for the next decode step."""
     if is_in_reasoning_or_tool_phase(
@@ -270,6 +316,7 @@ def should_ban_im_end(
         backtick_id=backtick_id,
         fence_id=fence_id,
         initial_reasoning=initial_reasoning,
+        trailing_backtick_ids=trailing_backtick_ids,
     )
 
 
@@ -302,6 +349,7 @@ def phase_banned_token_ids(
         initial_reasoning=initial_reasoning,
         backtick_id=resolve_vocab_token_id(vocab, _INLINE_BACKTICK),
         fence_id=resolve_vocab_token_id(vocab, _FENCE_BACKTICK),
+        trailing_backtick_ids=frozenset(trailing_backtick_token_ids(vocab)),
     ):
         banned.append(im_end)
 
@@ -338,6 +386,7 @@ def banned_ids_for_request(
         initial,
         backtick_id,
         fence_id,
+        trailing_backtick_ids,
     ) = cfg
     if should_ban_im_end(
         output_token_ids,
@@ -348,6 +397,7 @@ def banned_ids_for_request(
         initial_reasoning=initial,
         backtick_id=backtick_id,
         fence_id=fence_id,
+        trailing_backtick_ids=trailing_backtick_ids,
     ):
         return [im_end_id]
     return []
@@ -378,6 +428,7 @@ def should_ignore_stop_token(
         initial,
         _backtick_id,
         _fence_id,
+        _trailing_backtick_ids,
     ) = cfg
     if token_id != im_end_id:
         return False

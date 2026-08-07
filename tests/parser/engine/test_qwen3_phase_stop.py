@@ -25,6 +25,9 @@ _IM_END = 30
 _EOT = 31
 _BACKTICK = 40
 _FENCE = 41
+_SPACE_BACKTICK = 42
+_PAREN_BACKTICK = 43
+_DOUBLE_BACKTICK = 44
 
 
 _VOCAB = {
@@ -36,6 +39,11 @@ _VOCAB = {
     QWEN_END_OF_TEXT: _EOT,
     "`": _BACKTICK,
     "```": _FENCE,
+    # Merged BPE forms: prose opening backticks arrive as these, not as
+    # the lone "`" token ("Ġ`" byte-level form ends with "`" the same way).
+    " `": _SPACE_BACKTICK,
+    "(`": _PAREN_BACKTICK,
+    "``": _DOUBLE_BACKTICK,
 }
 
 
@@ -91,6 +99,64 @@ class TestPhaseDetection:
             tool_start_id=_TOOL_START,
             tool_end_id=_TOOL_END,
             initial_reasoning=True,
+        )
+
+
+class TestMergedBacktickStopGuard:
+    """Merged trailing-backtick BPE tokens must arm the one-step im_end ban.
+
+    Truncation scenario: answer reaches "... прямо внутри `" where the
+    opening backtick is the merged " `" token (space+backtick), not the
+    lone "`" id. The guard must fire for any token whose text ends with
+    exactly one backtick, or the model can stop mid-citation.
+    """
+
+    def _cfg(self, vocab=_VOCAB):
+        req = MagicMock()
+        req.logit_bias = None
+        req.bad_words = []
+        req.vllm_xargs = None
+        apply_endoftext_ban_to_request(req, vocab, initial_reasoning=True)
+        return req.vllm_xargs
+
+    def test_merged_space_backtick_bans_im_end(self):
+        cfg = self._cfg()
+        ids = [_THINK_END, 1, _SPACE_BACKTICK]
+        assert banned_ids_for_request(ids, cfg) == [_IM_END]
+
+    def test_merged_paren_backtick_bans_im_end(self):
+        cfg = self._cfg()
+        ids = [_THINK_END, 1, _PAREN_BACKTICK]
+        assert banned_ids_for_request(ids, cfg) == [_IM_END]
+
+    def test_config_carries_trailing_backtick_ids(self):
+        raw = self._cfg()[PHASE_BAN_XARG_KEY]
+        tail = set(raw[8:])
+        assert _SPACE_BACKTICK in tail
+        assert _PAREN_BACKTICK in tail
+
+    def test_double_backtick_not_in_trailing_set(self):
+        # "``" / "```" are fence-ish closers; stopping after them is legit.
+        raw = self._cfg()[PHASE_BAN_XARG_KEY]
+        tail = set(raw[8:])
+        assert _DOUBLE_BACKTICK not in tail
+        assert _FENCE not in tail
+
+    def test_lone_backtick_still_bans(self):
+        # Control (green on current code).
+        cfg = self._cfg()
+        assert banned_ids_for_request([_THINK_END, 1, _BACKTICK], cfg) == [_IM_END]
+
+    def test_merged_backtick_ban_is_non_sticky(self):
+        # Control: any token after the merged backtick re-allows im_end.
+        cfg = self._cfg()
+        assert banned_ids_for_request([_THINK_END, _SPACE_BACKTICK, 2], cfg) == []
+
+    def test_stop_ignore_stays_reasoning_only(self):
+        # Control: a sampled im_end after a merged backtick is never ignored.
+        cfg = self._cfg()
+        assert not should_ignore_stop_token(
+            _IM_END, [_THINK_END, 1, _SPACE_BACKTICK], cfg
         )
 
 

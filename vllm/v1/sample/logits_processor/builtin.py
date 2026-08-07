@@ -331,7 +331,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         self.device = device
         # index -> (im_end_id, output_tok_ids, think_start, think_end,
         #           tool_start, tool_end, initial_reasoning, backtick_id,
-        #           fence_id)
+        #           fence_id, trailing_backtick_ids)
         self.reqs: dict[
             int,
             tuple[
@@ -344,6 +344,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                 bool,
                 int | None,
                 int | None,
+                frozenset[int],
             ],
         ] = {}
         self.neg_inf_tensor = torch.tensor(
@@ -369,6 +370,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             bool,
             int | None,
             int | None,
+            frozenset[int],
         ]
         | None
     ):
@@ -384,6 +386,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             initial,
             backtick_id,
             fence_id,
+            trailing_backtick_ids,
         ) = cfg
         return (
             im_end_id,
@@ -395,6 +398,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             initial,
             backtick_id,
             fence_id,
+            trailing_backtick_ids,
         )
 
     def _active_ban_reqs(self) -> list[tuple[int, int]]:
@@ -411,6 +415,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             initial,
             backtick_id,
             fence_id,
+            trailing_backtick_ids,
         ) in self.reqs.items():
             if should_ban_im_end(
                 out_tok_ids,
@@ -421,6 +426,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                 initial_reasoning=initial,
                 backtick_id=backtick_id,
                 fence_id=fence_id,
+                trailing_backtick_ids=trailing_backtick_ids,
             ):
                 active.append((req_idx, im_end_id))
         return active

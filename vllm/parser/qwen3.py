@@ -384,5 +384,8 @@ class Qwen3Parser(ParserEngine):
             tool_start=self.TOOL_START,
             tool_end=self.TOOL_END,
             initial_reasoning=self.thinking_enabled,
+            # Tokenizer outlives per-request parser instances; keys the
+            # trailing-backtick vocab scan cache.
+            vocab_cache_key=id(self.model_tokenizer),
         )
         return request
