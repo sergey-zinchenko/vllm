@@ -331,7 +331,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         self.device = device
         # index -> (im_end_id, output_tok_ids, think_start, think_end,
         #           tool_start, tool_end, initial_reasoning, backtick_id,
-        #           fence_id, trailing_backtick_ids)
+        #           fence_id, close_paren_id, open_paren_id,
+        #           trailing_backtick_ids)
         self.reqs: dict[
             int,
             tuple[
@@ -342,6 +343,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                 int | None,
                 int | None,
                 bool,
+                int | None,
+                int | None,
                 int | None,
                 int | None,
                 frozenset[int],
@@ -370,6 +373,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             bool,
             int | None,
             int | None,
+            int | None,
+            int | None,
             frozenset[int],
         ]
         | None
@@ -386,6 +391,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             initial,
             backtick_id,
             fence_id,
+            close_paren_id,
+            open_paren_id,
             trailing_backtick_ids,
         ) = cfg
         return (
@@ -398,6 +405,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             initial,
             backtick_id,
             fence_id,
+            close_paren_id,
+            open_paren_id,
             trailing_backtick_ids,
         )
 
@@ -415,6 +424,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             initial,
             backtick_id,
             fence_id,
+            close_paren_id,
+            open_paren_id,
             trailing_backtick_ids,
         ) in self.reqs.items():
             banned = step_banned_ids(
@@ -428,6 +439,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                 backtick_id=backtick_id,
                 fence_id=fence_id,
                 trailing_backtick_ids=trailing_backtick_ids,
+                close_paren_id=close_paren_id,
+                open_paren_id=open_paren_id,
             )
             if banned:
                 active.append((req_idx, banned))

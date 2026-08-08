@@ -46,10 +46,15 @@ _FENCE_BACKTICK = "```"
 # Flattened SamplingParams.extra_args / vllm_xargs key.
 # Values: [im_end_id, think_start_id, think_end_id, tool_start_id,
 #          tool_end_id, initial_reasoning (0/1),
-#          backtick_id?, fence_id?, *trailing_backtick_ids] — missing ids
-# are -1. Trailing fields are optional for backward-compatible parse;
-# indices 8+ are merged BPE tokens whose text ends with one backtick.
+#          backtick_id?, fence_id?, close_paren_id?, open_paren_id?,
+#          *trailing_backtick_ids] — missing ids are -1. Trailing fields
+# are optional for backward-compatible parse; indices 10+ are merged BPE
+# tokens whose text ends with one backtick. Legacy configs without paren
+# slots still parse (paren None, trailing from index 8).
 PHASE_BAN_XARG_KEY = "qwen3_phase_ban"
+
+_CLOSE_PAREN = ")"
+_OPEN_PAREN = "("
 
 PhaseBanConfig = tuple[
     int,
@@ -58,6 +63,8 @@ PhaseBanConfig = tuple[
     int | None,
     int | None,
     bool,
+    int | None,
+    int | None,
     int | None,
     int | None,
     frozenset[int],
@@ -158,6 +165,8 @@ def apply_endoftext_ban_to_request(
         1 if initial_reasoning else 0,
         _id(_INLINE_BACKTICK),
         _id(_FENCE_BACKTICK),
+        _id(_CLOSE_PAREN),
+        _id(_OPEN_PAREN),
         *trailing_backtick_token_ids(vocab, cache_key=vocab_cache_key),
     ]
     xargs = getattr(request, "vllm_xargs", None)
@@ -174,9 +183,11 @@ def parse_phase_ban_config(
     """Parse flattened ``qwen3_phase_ban`` from SamplingParams.extra_args.
 
     Returns ``(im_end_id, think_start, think_end, tool_start, tool_end,
-    initial_reasoning, backtick_id, fence_id, trailing_backtick_ids)`` or
-    ``None`` if unset/invalid. Fields past index 5 are optional; legacy
-    shorter configs parse with ``None`` / empty tail.
+    initial_reasoning, backtick_id, fence_id, close_paren_id, open_paren_id,
+    trailing_backtick_ids)`` or ``None`` if unset/invalid. Fields past
+    index 5 are optional; legacy shorter configs parse with ``None`` /
+    empty tail. Layout with paren slots requires ``len >= 10``; otherwise
+    trailing starts at index 8 (pre-paren configs).
     """
     if not extra_args:
         return None
@@ -193,7 +204,14 @@ def parse_phase_ban_config(
 
     backtick_id = _opt(raw[6]) if len(raw) > 6 else None
     fence_id = _opt(raw[7]) if len(raw) > 7 else None
-    trailing = frozenset(int(v) for v in raw[8:] if int(v) >= 0)
+    if len(raw) >= 10:
+        close_paren_id = _opt(raw[8])
+        open_paren_id = _opt(raw[9])
+        trailing = frozenset(int(v) for v in raw[10:] if int(v) >= 0)
+    else:
+        close_paren_id = None
+        open_paren_id = None
+        trailing = frozenset(int(v) for v in raw[8:] if int(v) >= 0)
     return (
         im_end_id,
         _opt(raw[1]),
@@ -203,6 +221,8 @@ def parse_phase_ban_config(
         bool(int(raw[5])),
         backtick_id,
         fence_id,
+        close_paren_id,
+        open_paren_id,
         trailing,
     )
 
@@ -262,9 +282,9 @@ def ends_with_dangling_backtick(
     Matches the lone `` ` `` id and merged BPE forms (``" `"``, ``"(`"``
     ...) whose text ends with exactly one backtick — prose openings almost
     never tokenize as the bare backtick, and the truncation happens right
-    after those merged forms. Applies inside reasoning too (im_end guard
-    only; cited structural ids stay sampleable and the parser keeps them
-    inert inside markdown code).
+    after those merged forms. Applies inside reasoning too: the one-step
+    ban covers ``im_end`` and ``think_end`` (tool / think_start stay
+    sampleable; the parser keeps tool-tag citations inert in code).
 
     Deliberately **not** span parity: counting one vocab id sees only one
     side of real inline spans, sticks odd, and bans ``im_end`` for the
@@ -325,32 +345,36 @@ def step_banned_ids(
     backtick_id: int | None = None,
     fence_id: int | None = None,
     trailing_backtick_ids: frozenset[int] = frozenset(),
+    close_paren_id: int | None = None,
+    open_paren_id: int | None = None,
 ) -> list[int]:
     """Token ids banned for the next decode step.
 
-    Two independent rules compose, both banning only ``im_end``:
-    - reasoning phase: banned while inside the think block;
-    - dangling backtick: banned for exactly one step after an opening
-      `` ` `` (stop right after an opening backtick truncates the
-      citation).
+    Rules compose:
+    - reasoning phase: ``im_end`` banned while inside the think block;
+    - dangling backtick: ``im_end`` **and** ``think_end`` banned for
+      exactly one step after an opening `` ` ``;
+    - empty start (no output yet, initial reasoning): ``think_end`` and
+      bare ``)`` / ``(`` banned so polluted history cannot open with a
+      lone paren or instantly close think.
 
-    Structural think/tool ids are deliberately **not** banned after a
-    backtick: cited special ids inside backticks are legal — the parser's
-    markdown-code inert rule keeps them raw prose. Banning them knocked
-    the model off its citation path mid-sentence (bail into newline +
-    early ``</think>``, tail of the sentence lost).
+    Banning ``think_end`` after a backtick blocks the early-close path
+    (model samples a real ``</think>`` id mid-citation and ends think).
+    ``think_start`` / tool ids stay legal so `` `<tool_call>` `` citations
+    can still use the special id; the parser keeps them inert in markdown
+    code. A `` `</think>` `` citation must be spelled with plain-text BPE
+    tokens instead (already covered by the code-span path).
     """
     banned: list[int] = []
-    if im_end_id is None:
-        return banned
-    if is_in_reasoning_or_tool_phase(
+    in_reasoning = is_in_reasoning_or_tool_phase(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
         tool_start_id=tool_start_id,
         tool_end_id=tool_end_id,
         initial_reasoning=initial_reasoning,
-    ) or ends_with_dangling_backtick(
+    )
+    dangling = ends_with_dangling_backtick(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
@@ -358,8 +382,17 @@ def step_banned_ids(
         fence_id=fence_id,
         initial_reasoning=initial_reasoning,
         trailing_backtick_ids=trailing_backtick_ids,
-    ):
+    )
+    if im_end_id is not None and (in_reasoning or dangling):
         banned.append(im_end_id)
+    if dangling and think_end_id is not None and think_end_id not in banned:
+        banned.append(think_end_id)
+    if not output_token_ids and initial_reasoning:
+        if think_end_id is not None and think_end_id not in banned:
+            banned.append(think_end_id)
+        for tid in (close_paren_id, open_paren_id):
+            if tid is not None and tid not in banned:
+                banned.append(tid)
     return banned
 
 
@@ -394,6 +427,8 @@ def phase_banned_token_ids(
             backtick_id=resolve_vocab_token_id(vocab, _INLINE_BACKTICK),
             fence_id=resolve_vocab_token_id(vocab, _FENCE_BACKTICK),
             trailing_backtick_ids=frozenset(trailing_backtick_token_ids(vocab)),
+            close_paren_id=resolve_vocab_token_id(vocab, _CLOSE_PAREN),
+            open_paren_id=resolve_vocab_token_id(vocab, _OPEN_PAREN),
         )
     )
     return banned
@@ -429,6 +464,8 @@ def banned_ids_for_request(
         initial,
         backtick_id,
         fence_id,
+        close_paren_id,
+        open_paren_id,
         trailing_backtick_ids,
     ) = cfg
     return step_banned_ids(
@@ -442,6 +479,8 @@ def banned_ids_for_request(
         backtick_id=backtick_id,
         fence_id=fence_id,
         trailing_backtick_ids=trailing_backtick_ids,
+        close_paren_id=close_paren_id,
+        open_paren_id=open_paren_id,
     )
 
 
@@ -470,6 +509,8 @@ def should_ignore_stop_token(
         initial,
         _backtick_id,
         _fence_id,
+        _close_paren_id,
+        _open_paren_id,
         _trailing_backtick_ids,
     ) = cfg
     if token_id != im_end_id:

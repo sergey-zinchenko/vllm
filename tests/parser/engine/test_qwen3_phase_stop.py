@@ -28,6 +28,8 @@ _FENCE = 41
 _SPACE_BACKTICK = 42
 _PAREN_BACKTICK = 43
 _DOUBLE_BACKTICK = 44
+_CLOSE_PAREN = 45
+_OPEN_PAREN = 46
 
 
 _VOCAB = {
@@ -44,6 +46,8 @@ _VOCAB = {
     " `": _SPACE_BACKTICK,
     "(`": _PAREN_BACKTICK,
     "``": _DOUBLE_BACKTICK,
+    ")": _CLOSE_PAREN,
+    "(": _OPEN_PAREN,
 }
 
 
@@ -131,14 +135,15 @@ class TestMergedBacktickStopGuard:
 
     def test_config_carries_trailing_backtick_ids(self):
         raw = self._cfg()[PHASE_BAN_XARG_KEY]
-        tail = set(raw[8:])
+        # [8]=close_paren, [9]=open_paren, [10+]=trailing backtick ids
+        tail = set(raw[10:])
         assert _SPACE_BACKTICK in tail
         assert _PAREN_BACKTICK in tail
 
     def test_double_backtick_not_in_trailing_set(self):
         # "``" / "```" are fence-ish closers; stopping after them is legit.
         raw = self._cfg()[PHASE_BAN_XARG_KEY]
-        tail = set(raw[8:])
+        tail = set(raw[10:])
         assert _DOUBLE_BACKTICK not in tail
         assert _FENCE not in tail
 
@@ -160,16 +165,14 @@ class TestMergedBacktickStopGuard:
 
 
 class TestBacktickCitationIdsAllowed:
-    """A dangling backtick bans only ``im_end`` — structural ids stay legal.
+    """A dangling backtick bans ``im_end`` + ``think_end`` only.
 
-    Regression (screenshot series, same prompt replayed): banning the
-    whole think/tool id family after an opening `` ` `` knocked the model
-    off its citation path — it bailed into a newline + early ``</think>``
-    and the sentence lost its tail ("… fix the `" then nothing). Cited
-    special ids inside backticks are handled by the parser instead (the
-    markdown-code inert rule keeps them raw prose), so the sampler must
-    not fight them. Only the original "stop right after an opening
-    backtick" im_end guard remains.
+    Banning the whole think/tool family after an opening `` ` `` knocked
+    the model off `` `<tool_call>` `` citations. But allowing ``think_end``
+    again re-opened the early-close path: the model samples a real
+    ``</think>`` id mid-citation and ends think (screenshot: "Treat `"
+    then nothing). Surgical rule — ban ``im_end`` and ``think_end``;
+    keep ``think_start`` / tool ids sampleable for tool-tag citations.
     """
 
     def _cfg(self):
@@ -180,27 +183,28 @@ class TestBacktickCitationIdsAllowed:
         apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
         return req.vllm_xargs
 
-    def test_reasoning_backtick_allows_think_end(self):
-        # A cited `</think>` id right after " `" must be sampleable;
-        # the parser's markdown-inert rule keeps it prose.
+    def test_reasoning_backtick_bans_think_end(self):
+        # Real </think> id right after " `" must not be sampleable.
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert _THINK_END not in banned
+        assert _THINK_END in banned
         assert _IM_END in banned
 
-    def test_reasoning_backtick_allows_whole_family(self):
+    def test_reasoning_backtick_allows_tool_and_think_start(self):
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert banned.isdisjoint({_THINK_START, _THINK_END, _TOOL_START, _TOOL_END})
+        assert banned.isdisjoint({_THINK_START, _TOOL_START, _TOOL_END})
 
-    def test_answer_backtick_allows_structural_ids(self):
+    def test_answer_backtick_bans_im_end_and_think_end(self):
         ids = [_THINK_END, 1, _SPACE_BACKTICK]
-        assert banned_ids_for_request(ids, self._cfg()) == [_IM_END]
+        banned = banned_ids_for_request(ids, self._cfg())
+        assert set(banned) == {_IM_END, _THINK_END}
 
-    def test_lone_backtick_allows_family_too(self):
+    def test_lone_backtick_allows_tool_ids(self):
         banned = set(banned_ids_for_request([1, _BACKTICK], self._cfg()))
-        assert banned.isdisjoint({_THINK_END, _TOOL_START})
+        assert _TOOL_START not in banned
+        assert _THINK_END in banned
         assert _IM_END in banned
 
-    def test_im_end_ban_is_non_sticky(self):
+    def test_ban_is_non_sticky(self):
         # Control: one token later only the reasoning-phase im_end ban
         # remains ([1, ...] is still mid-think).
         cfg = self._cfg()
@@ -327,8 +331,8 @@ class TestDanglingBacktick:
             backtick_id=_BACKTICK,
             fence_id=_FENCE,
         )
-        # The backtick rule itself still fires mid-think (im_end guard);
-        # structural ids are no longer banned by it.
+        # The backtick rule itself still fires mid-think (im_end +
+        # think_end guard); tool / think_start ids stay legal.
         assert ends_with_dangling_backtick(
             ids,
             think_start_id=_THINK_START,
@@ -376,9 +380,11 @@ class TestRequestWiring:
         assert cfg[0] == _IM_END
         assert cfg[6] == _BACKTICK
         assert cfg[7] == _FENCE
+        assert cfg[8] == _CLOSE_PAREN
+        assert cfg[9] == _OPEN_PAREN
 
     def test_parse_phase_ban_config_backward_compatible_without_backtick(self):
-        """Legacy 6-field configs still parse (backtick/fence None)."""
+        """Legacy 6-field configs still parse (backtick/fence/paren None)."""
         cfg = parse_phase_ban_config(
             {
                 PHASE_BAN_XARG_KEY: [
@@ -394,6 +400,8 @@ class TestRequestWiring:
         assert cfg is not None
         assert cfg[6] is None
         assert cfg[7] is None
+        assert cfg[8] is None
+        assert cfg[9] is None
 
     def test_endoftext_ban_compatible_with_speculative_verify(self):
         """Regression: adjust_request must not trip MTP logit_bias reject."""
@@ -446,8 +454,9 @@ class TestRequestWiring:
                 _FENCE,
             ]
         }
-        assert _IM_END in banned_ids_for_request([_THINK_END, _BACKTICK], extra)
-        # Non-sticky: any token after the backtick re-allows im_end.
+        banned = set(banned_ids_for_request([_THINK_END, _BACKTICK], extra))
+        assert {_IM_END, _THINK_END} <= banned
+        # Non-sticky: any token after the backtick re-allows both.
         assert banned_ids_for_request([_THINK_END, _BACKTICK, 1], extra) == []
 
     def test_should_ignore_stop_token_reasoning_only(self):
@@ -473,3 +482,38 @@ class TestRequestWiring:
         assert not should_ignore_stop_token(_IM_END, [_THINK_END], extra)
         assert not should_ignore_stop_token(_IM_END, [_THINK_END, _BACKTICK], extra)
         assert not should_ignore_stop_token(999, [1, 2], extra)
+
+
+class TestEmptyStartBan:
+    """First decode step must not open with ``)``/``(`` or instant ``</think>``."""
+
+    def _cfg(self):
+        req = MagicMock()
+        req.logit_bias = None
+        req.bad_words = []
+        req.vllm_xargs = None
+        apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
+        return req.vllm_xargs
+
+    def test_empty_output_bans_think_end_and_parens(self):
+        banned = set(banned_ids_for_request([], self._cfg()))
+        assert {_IM_END, _THINK_END, _CLOSE_PAREN, _OPEN_PAREN} <= banned
+
+    def test_after_first_token_parens_and_instant_close_allowed(self):
+        # One accepted token clears empty-start bans; phase im_end remains.
+        banned = set(banned_ids_for_request([1], self._cfg()))
+        assert banned == {_IM_END}
+        assert _THINK_END not in banned
+        assert _CLOSE_PAREN not in banned
+        assert _OPEN_PAREN not in banned
+
+    def test_empty_without_initial_reasoning_skips_empty_start(self):
+        req = MagicMock()
+        req.logit_bias = None
+        req.bad_words = []
+        req.vllm_xargs = None
+        apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=False)
+        banned = set(banned_ids_for_request([], req.vllm_xargs))
+        assert _THINK_END not in banned
+        assert _CLOSE_PAREN not in banned
+        assert _OPEN_PAREN not in banned

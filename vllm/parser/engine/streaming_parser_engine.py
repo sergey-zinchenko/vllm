@@ -190,6 +190,7 @@ class StreamingParserEngine:
         self._tool_preamble_buffer = ""
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
+        self._think_end_pending_after_broken_inline = False
         self._answer_content_started = False
         # True after the first non-whitespace REASONING_CHUNK. Distinguishes
         # the template leading ``<think>`` (still stripped) from a mid-think
@@ -202,6 +203,10 @@ class StreamingParserEngine:
         # must stay inert (no REASONING_END / tool transitions).
         self._md_inline_odd = False
         self._md_in_fence = False
+        # Set when a dangling inline `` ` `` is closed by newline. The next
+        # ``</think>`` is often a broken citation (`` `\n</think>` ``); see
+        # ``_think_end_pending_after_broken_inline``.
+        self._md_inline_closed_by_newline = False
         # Open <parameter=...> depth inside TOOL_ARGS (nested </tool_call>).
         self._param_depth = 0
         self._reset_args_state()
@@ -314,8 +319,7 @@ class StreamingParserEngine:
                         tool_index=self.tool_index,
                     )
                 )
-            self._think_end_marker = ""
-            self._think_end_pending_buffer = ""
+            self._clear_think_end_pending_flags()
             self.state = ParserState.CONTENT
         elif self.state == ParserState.REASONING:
             events.append(
@@ -405,21 +409,27 @@ class StreamingParserEngine:
 
     @staticmethod
     def _neutralize_tag_literals(text: str, literals: list[str]) -> str:
-        """Insert ZWSP after ``<`` so client tag scanners cannot match."""
+        """Replace ASCII ``<>`` with fullwidth so client tag scanners miss.
+
+        U+FF1C/U+FF1E look nearly identical in UI fonts but break both
+        exact ``<tool_call>`` matches and loose ``/<[^>]+>/`` regexes.
+        ZWSP-after-``<`` was not enough for the latter.
+        """
         for lit in literals:
             if lit in text:
-                text = text.replace(lit, lit.replace("<", "<\u200b", 1))
+                text = text.replace(lit, lit.replace("<", "＜").replace(">", "＞"))
         return text
 
     def _escape_and_feed(self, text: str, *, escape: bool = True) -> str:
         """Update markdown code state and transform structural tag literals.
 
         HTML entities are not interpreted in markdown code spans, so tags
-        inside `` `...` `` / ```...``` are ZWSP-neutralized instead of
-        escaped: rendering is identical, but raw-stream clients that
-        scan for tool markup before markdown rendering no longer eat the
-        citation (empty-block artifact). Outside code, tags are escaped
-        for UI-safe prose when *escape* is True and kept raw otherwise.
+        inside `` `...` `` / ```...``` are neutralized with fullwidth
+        brackets instead of escaped: rendering is nearly identical, but
+        raw-stream clients that scan for ASCII tool markup before
+        markdown rendering no longer eat the citation (empty-block
+        artifact). Outside code, tags are escaped for UI-safe prose when
+        *escape* is True and kept raw otherwise.
         """
         if not text:
             return ""
@@ -450,12 +460,14 @@ class StreamingParserEngine:
                 self._md_in_fence = not self._md_in_fence
                 if self._md_in_fence:
                     self._md_inline_odd = False
+                self._md_inline_closed_by_newline = False
                 out.append("```")
                 i += 3
                 continue
             if not self._md_in_fence and text[i] == "`":
                 flush_seg()
                 self._md_inline_odd = not self._md_inline_odd
+                self._md_inline_closed_by_newline = False
                 out.append("`")
                 i += 1
                 continue
@@ -465,6 +477,7 @@ class StreamingParserEngine:
                     out.append("".join(seg))
                     seg.clear()
                 self._md_inline_odd = False
+                self._md_inline_closed_by_newline = True
                 out.append("\n")
                 i += 1
                 continue
@@ -580,8 +593,7 @@ class StreamingParserEngine:
         if self._reasoning_end_before_tool or self._think_end_marker:
             marker = self._terminal_text("THINK_END", self._think_end_marker)
             think_ws = self._think_end_pending_buffer
-            self._think_end_marker = ""
-            self._think_end_pending_buffer = ""
+            self._clear_think_end_pending_flags()
             self._reasoning_end_before_tool = False
             self.state = ParserState.REASONING
             raw = f"{marker}{think_ws}{preamble}"
@@ -611,7 +623,9 @@ class StreamingParserEngine:
         ]
 
     @classmethod
-    def _is_false_think_end_continuation(cls, text: str) -> bool:
+    def _is_false_think_end_continuation(
+        cls, text: str, *, after_broken_inline: bool = False
+    ) -> bool:
         """Whether text after ``</think>`` looks like mid-sentence prose.
 
         Missing a real think end swallows the whole answer into the
@@ -620,7 +634,9 @@ class StreamingParserEngine:
         evidence — cased-lowercase prose, a ``<|…|>``-style mention, or
         closing/sentence punctuation. Everything else (Uppercase, CJK,
         digits, markdown markup like ``#``/``-``/``*``/``>``, emoji)
-        commits the end.
+        commits the end — except after a newline-broken dangling
+        backtick, where Uppercase Latin is usually more CoT
+        (`` `\n</think>\n\nThe user…` ``) rather than a real answer.
         """
         if not text.strip():
             return True
@@ -641,7 +657,17 @@ class StreamingParserEngine:
         if first in ",;:)]}'\"`.?!":
             return True
         # Cased-lowercase continues the reasoning sentence.
-        return first.islower()
+        if first.islower():
+            return True
+        # After newline-broken `` ` ``, Uppercase Latin is usually more
+        # CoT (`` `\n</think>\n\nThe user…` ``), not a real answer.
+        return after_broken_inline and first.isascii() and first.isupper()
+
+    def _clear_think_end_pending_flags(self) -> None:
+        self._think_end_marker = ""
+        self._think_end_pending_buffer = ""
+        self._think_end_pending_after_broken_inline = False
+        self._md_inline_closed_by_newline = False
 
     def _resolve_think_end_pending(self, text: str) -> list[SemanticEvent]:
         """Commit or abort a deferred ``</think>`` using following text."""
@@ -651,10 +677,12 @@ class StreamingParserEngine:
 
         marker = self._terminal_text("THINK_END", self._think_end_marker)
         buffered = self._think_end_pending_buffer
-        self._think_end_marker = ""
-        self._think_end_pending_buffer = ""
+        after_broken = self._think_end_pending_after_broken_inline
+        self._clear_think_end_pending_flags()
 
-        if self._is_false_think_end_continuation(text):
+        if self._is_false_think_end_continuation(
+            text, after_broken_inline=after_broken
+        ):
             self.state = ParserState.REASONING
             raw = f"{marker}{buffered}{text}"
             value = self._escape_and_feed(raw)
@@ -726,7 +754,7 @@ class StreamingParserEngine:
                 self._note_reasoning_content(text)
             elif content_type == EventType.TEXT_CHUNK:
                 # No prose escaping in the answer, but code-span tag
-                # literals still get ZWSP-neutralized — unless this
+                # literals still get fullwidth-neutralized — unless this
                 # content is re-fed to a tool engine with the original
                 # token ids (skip_tool_parsing), where transforming
                 # would break the id/text anchoring of its scanner.
@@ -790,6 +818,9 @@ class StreamingParserEngine:
         ):
             self._think_end_marker = self._terminal_text("THINK_END", value)
             self._think_end_pending_buffer = ""
+            self._think_end_pending_after_broken_inline = (
+                self._md_inline_closed_by_newline
+            )
 
         # Extra </think> while still deciding — keep as literal text.
         if (
@@ -826,8 +857,7 @@ class StreamingParserEngine:
                     )
                 )
                 self._reasoning_end_before_tool = False
-                self._think_end_marker = ""
-                self._think_end_pending_buffer = ""
+                self._clear_think_end_pending_flags()
             self._tool_preamble_open = ""
             self._tool_preamble_buffer = ""
         elif (
@@ -842,8 +872,7 @@ class StreamingParserEngine:
             previous_state == ParserState.THINK_END_PENDING
             and EventType.REASONING_END in transition.events
         ):
-            self._think_end_marker = ""
-            self._think_end_pending_buffer = ""
+            self._clear_think_end_pending_flags()
             self._reasoning_end_before_tool = False
 
         if (

@@ -20,6 +20,7 @@ from tests.parser.engine.replay_harness import (
     DUMMY_TOOLS,
     collect_output,
     replay_streaming,
+    replay_with_text_holdback,
 )
 from tests.parser.engine.replay_harness import (
     MockTokenizer as ReplayMockTokenizer,
@@ -52,19 +53,20 @@ def _esc_tag(tag: str) -> str:
     return tag.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-_ZWSP = "\u200b"
+_FW_LT = "＜"
+_FW_GT = "＞"
 
 
-def _zwsp_tag(tag: str) -> str:
-    """ZWSP-neutralized form emitted inside markdown code spans."""
-    return tag.replace("<", "<" + _ZWSP, 1)
+def _fw_tag(tag: str) -> str:
+    """Fullwidth-bracket form emitted inside markdown code spans."""
+    return tag.replace("<", _FW_LT).replace(">", _FW_GT)
 
 
 def _assert_tag_visible(text: str | None, tag: str) -> None:
-    """Tag must appear as raw, escaped or ZWSP prose (never silently dropped)."""
+    """Tag must appear as raw, escaped or fullwidth prose (never dropped)."""
     assert text is not None
-    assert tag in text or _esc_tag(tag) in text or _zwsp_tag(tag) in text, (
-        f"expected {tag!r} (raw/escaped/zwsp) in {text!r}"
+    assert tag in text or _esc_tag(tag) in text or _fw_tag(tag) in text, (
+        f"expected {tag!r} (raw/escaped/fullwidth) in {text!r}"
     )
 
 
@@ -1040,6 +1042,66 @@ class TestMarkdownInertStructuralTags:
         assert collect_function_name(results) == "get_weather"
         assert "<function=" not in collect_content(results)
 
+    def test_newline_broken_think_end_citation_stays_reasoning(self, parser):
+        """`` `\n</think>\n\nThe user…` `` must not leak CoT into content.
+
+        Production log (chatcmpl-82e137…): model cites ``</think>`` after a
+        newline-closed dangling backtick, then continues with Uppercase
+        CoT. Without sticky broken-inline handling that phrase becomes
+        answer text (runaway reasoning in the client).
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "The user is asking for PRs discussing the fix for the `",
+                "\n",
+                "</think>",
+                "\n\nThe user wants me to look for pull requests.",
+                "\nStill planning.",
+                "</think>",
+                "\n\nFinal answer.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+                (4,),
+                (_THINK_END_ID,),
+                (5,),
+            ],
+        )
+        assert "The user wants me to look" in reasoning
+        assert "Still planning." in reasoning
+        assert "The user wants me to look" not in content
+        assert content.lstrip() == "Final answer."
+
+    def test_newline_broken_think_end_then_tool_still_emits(
+        self, parser_with_tools, mock_request
+    ):
+        """Sticky broken-inline must not block real end + tool recovery."""
+        from tests.parser.engine.streaming_helpers import (
+            collect_content,
+            collect_function_name,
+            simulate_tool_streaming,
+        )
+
+        chunks = [
+            "discussing the fix for the `",
+            "\n",
+            "</think>\n\n",
+            "The user wants more search.\n",
+            "</think>\n\n",
+            "<tool_call>\n",
+            "<function=get_weather>\n",
+            "<parameter=city>Tokyo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser_with_tools, mock_request, chunks)
+        assert collect_function_name(results) == "get_weather"
+        assert "<function=" not in collect_content(results)
+
 
 class TestMidReasoningCitations:
     """Cited think tags mid-reasoning must never leave holes.
@@ -1080,7 +1142,7 @@ class TestMidReasoningCitations:
         assert content == "Answer."
 
     def test_code_span_cited_think_start_raw(self, parser):
-        # Inside backticks the tag is ZWSP-neutralized (never HTML-escaped):
+        # Inside backticks the tag is fullwidth-neutralized (never HTML-escaped):
         # client-side tool-markup scanners must not match the raw literal.
         reasoning, _ = simulate_reasoning_streaming(
             parser,
@@ -1093,7 +1155,7 @@ class TestMidReasoningCitations:
                 (3,),
             ],
         )
-        assert f"`{_zwsp_tag('<think>')}`" in reasoning
+        assert f"`{_fw_tag('<think>')}`" in reasoning
         assert "<think>" not in reasoning
         assert "&lt;" not in reasoning
 
@@ -1108,11 +1170,11 @@ class TestMidReasoningCitations:
             ],
         )
         assert content == ""
-        assert f"`{_zwsp_tag('</think>')}`" in reasoning
+        assert f"`{_fw_tag('</think>')}`" in reasoning
         assert "</think>" not in reasoning
         assert "&lt;" not in reasoning
 
-    def test_fenced_block_cited_tag_zwsp(self, parser):
+    def test_fenced_block_cited_tag_fullwidth(self, parser):
         reasoning, _ = simulate_reasoning_streaming(
             parser,
             ["example:\n```\n", "<tool_call>", "\n``` done. ", "</think>", "A"],
@@ -1124,7 +1186,7 @@ class TestMidReasoningCitations:
                 (3,),
             ],
         )
-        assert _zwsp_tag("<tool_call>") in reasoning
+        assert _fw_tag("<tool_call>") in reasoning
         assert "<tool_call>" not in reasoning
         assert "&lt;" not in reasoning
 
@@ -1244,7 +1306,7 @@ class TestMarkdownAnswerAfterThinkEnd:
             ],
         )
         assert content == "Answer."
-        assert _zwsp_tag("</think>") in reasoning
+        assert _fw_tag("</think>") in reasoning
 
     def test_control_lowercase_continuation_stays_reasoning(self, parser):
         # GREEN control: bare cited tag + lowercase tail continues think.
@@ -1483,7 +1545,7 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert f"`{_zwsp_tag('<tool_call>')}`" in out.reasoning
+        assert f"`{_fw_tag('<tool_call>')}`" in out.reasoning
         assert "<tool_call>" not in out.reasoning
         assert self._CITE_PRE in out.reasoning
         assert '` as literal text"). ' in out.reasoning
@@ -1503,7 +1565,7 @@ class TestToolTagCitationServing:
             chunk_size,
         )
         assert out.reasoning == "thinking. "
-        assert f"`{_zwsp_tag('<tool_call>')}`" in out.content
+        assert f"`{_fw_tag('<tool_call>')}`" in out.content
         assert "<tool_call>" not in out.content
         assert self._CITE_PRE in out.content
         assert "Tail continues." in out.content
@@ -1539,7 +1601,7 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert f"`{_zwsp_tag('<tool_call>')}`" in out.reasoning
+        assert f"`{_fw_tag('<tool_call>')}`" in out.reasoning
         assert "<tool_call>" not in out.reasoning
         assert '` as literal text"). ' in out.reasoning
         assert out.content == "Answer."
@@ -1557,7 +1619,93 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert f"`{_zwsp_tag('<tool_call>')}`" in out.content
+        assert f"`{_fw_tag('<tool_call>')}`" in out.content
         assert "<tool_call>" not in out.content
         assert "Tail continues." in out.content
+        assert out.tool_calls == []
+
+
+class TestBacktickCitationHoldback:
+    """Dangling-backtick citations must survive detokenizer holdback.
+
+    Production: token ids arrive before decoded text. A backtick id with
+    empty delta_text leaves markdown state unset; a following ``</think>``
+    special id would close think for real. The sampler bans ``think_end``
+    for that one step; the parser still keeps `` `<tool_call>` `` citations
+    intact when text and ids are (eventually) aligned.
+    """
+
+    def test_sampler_bans_think_end_after_backtick_id(self):
+        from vllm.parser.qwen3_phase_stop import (
+            PHASE_BAN_XARG_KEY,
+            banned_ids_for_request,
+        )
+
+        # Holdback-shaped history: only ids matter for the ban.
+        backtick, space_bt, im_end, think_end, tool_start = 40, 42, 30, 51, 60
+        extra = {
+            PHASE_BAN_XARG_KEY: [
+                im_end,
+                50,
+                think_end,
+                tool_start,
+                61,
+                1,
+                backtick,
+                41,
+                space_bt,
+            ]
+        }
+        banned = set(banned_ids_for_request([1, space_bt], extra))
+        assert {im_end, think_end} <= banned
+        assert tool_start not in banned
+        banned_lone = set(banned_ids_for_request([1, backtick], extra))
+        assert {im_end, think_end} <= banned_lone
+
+    def test_treat_tool_call_citation_keeps_tail(self, mock_tokenizer):
+        # Aligned text+ids: the screenshot sentence must not lose its tail.
+        parser = Qwen3Parser(mock_tokenizer)
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                'vllm#35687: "Treat `',
+                "<tool_call>",
+                '` as implicit reasoning end." ',
+                "</think>",
+                "Answer.",
+            ],
+            [
+                (1,),
+                (_TOOL_CALL_ID,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert "Treat `" in reasoning
+        assert "as implicit reasoning end." in reasoning
+        assert _fw_tag("<tool_call>") in reasoning
+        assert "<tool_call>" not in reasoning
+        assert content == "Answer."
+
+    def test_treat_tool_call_citation_survives_text_holdback(self, mock_tokenizer):
+        tokens = [
+            (100, 'vllm#35687: "Treat `'),
+            (_TOOL_CALL_ID, "<tool_call>"),
+            (101, '` as implicit reasoning end." '),
+            (_THINK_END_ID, "</think>"),
+            (102, "Answer."),
+        ]
+        parser = _Qwen3DelegatingParser(mock_tokenizer)
+        deltas = replay_with_text_holdback(
+            parser,
+            tokens,
+            text_delay=1,
+            tools=DUMMY_TOOLS,
+        )
+        out = collect_output(deltas)
+        assert "Treat `" in out.reasoning
+        assert "as implicit reasoning end." in out.reasoning
+        assert _fw_tag("<tool_call>") in out.reasoning
+        assert out.content == "Answer."
         assert out.tool_calls == []

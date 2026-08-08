@@ -1281,9 +1281,9 @@ class TestHardenedInvariants:
         result = parser_with_tools.extract_tool_calls(text, mock_request)
         assert result.tools_called is False
         assert result.tool_calls == []
-        # Inside fenced code the tag is ZWSP-neutralized so raw-stream
-        # clients scanning for tool markup cannot eat it.
-        assert "<\u200btool_call>" in (result.content or "")
+        # Inside fenced code the tag uses fullwidth brackets so raw-stream
+        # clients scanning for ASCII tool markup cannot eat it.
+        assert "\uff1ctool_call\uff1e" in (result.content or "")
         assert "not_a_real_tool" in (result.content or "")
 
     def test_fenced_example_with_real_tool_name_stays_content(
@@ -1305,7 +1305,7 @@ class TestHardenedInvariants:
         result = parser_with_tools.extract_tool_calls(text, mock_request)
         assert result.tools_called is False
         assert result.tool_calls == []
-        assert "<\u200btool_call>" in (result.content or "")
+        assert "\uff1ctool_call\uff1e" in (result.content or "")
         assert "get_weather" in (result.content or "")
         assert "Итог" in (result.content or "")
 
