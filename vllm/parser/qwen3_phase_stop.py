@@ -277,27 +277,32 @@ def ends_with_dangling_backtick(
     initial_reasoning: bool = True,
     trailing_backtick_ids: frozenset[int] = frozenset(),
 ) -> bool:
-    """True when the last token ends with an opening `` ` `` — any phase.
+    """True when an opening `` ` `` is in the last two tokens — any phase.
 
     Matches the lone `` ` `` id and merged BPE forms (``" `"``, ``"(`"``
     ...) whose text ends with exactly one backtick — prose openings almost
     never tokenize as the bare backtick, and the truncation happens right
-    after those merged forms. Applies inside reasoning too: the one-step
-    ban covers ``im_end`` and ``think_end`` (tool / think_start stay
-    sampleable; the parser keeps tool-tag citations inert in code).
+    after those merged forms. Applies inside reasoning too: the ban covers
+    ``im_end`` and ``think_end`` (tool / think_start stay sampleable; the
+    parser keeps tool-tag citations inert in code).
 
     Deliberately **not** span parity: counting one vocab id sees only one
     side of real inline spans, sticks odd, and bans ``im_end`` for the
     rest of the request (endless ``!!!`` tails, rewritten endings under
-    MTP). Checking only the immediately preceding token blocks the "stop
-    right after opening backtick" pattern while staying non-sticky: any
-    other token re-allows ``im_end``.
+    MTP). A one-token window let `` `\n</think>`` clear the guard (newline
+    or MTP first draft); the two-token window still blocks that path
+    without sticking for the whole request.
     """
     del think_start_id, think_end_id, fence_id, initial_reasoning
     if not output_token_ids:
         return False
-    last = output_token_ids[-1]
-    return last == backtick_id or last in trailing_backtick_ids
+
+    def _is_backtick(tid: int) -> bool:
+        return tid == backtick_id or tid in trailing_backtick_ids
+
+    if _is_backtick(output_token_ids[-1]):
+        return True
+    return len(output_token_ids) >= 2 and _is_backtick(output_token_ids[-2])
 
 
 def should_ban_im_end(
@@ -353,7 +358,7 @@ def step_banned_ids(
     Rules compose:
     - reasoning phase: ``im_end`` banned while inside the think block;
     - dangling backtick: ``im_end`` **and** ``think_end`` banned for
-      exactly one step after an opening `` ` ``;
+      a two-token window after an opening `` ` `` (covers `` `\n</think>``);
     - empty start (no output yet, initial reasoning): ``think_end`` and
       bare ``)`` / ``(`` banned so polluted history cannot open with a
       lone paren or instantly close think.

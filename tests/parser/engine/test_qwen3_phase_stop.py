@@ -107,7 +107,7 @@ class TestPhaseDetection:
 
 
 class TestMergedBacktickStopGuard:
-    """Merged trailing-backtick BPE tokens must arm the one-step im_end ban.
+    """Merged trailing-backtick BPE tokens must arm the im_end ban window.
 
     Truncation scenario: answer reaches "... прямо внутри `" where the
     opening backtick is the merged " `" token (space+backtick), not the
@@ -151,10 +151,17 @@ class TestMergedBacktickStopGuard:
         cfg = self._cfg()
         assert _IM_END in banned_ids_for_request([_THINK_END, 1, _BACKTICK], cfg)
 
-    def test_merged_backtick_ban_is_non_sticky(self):
-        # Control: any token after the merged backtick re-allows im_end.
+    def test_merged_backtick_plus_one_still_bans_im_end(self):
+        # Two-token window: one token after merged backtick still bans.
         cfg = self._cfg()
-        assert banned_ids_for_request([_THINK_END, _SPACE_BACKTICK, 2], cfg) == []
+        assert _IM_END in banned_ids_for_request(
+            [_THINK_END, _SPACE_BACKTICK, 2], cfg
+        )
+
+    def test_merged_backtick_ban_is_non_sticky_after_two(self):
+        # Control: two tokens after the merged backtick re-allows im_end.
+        cfg = self._cfg()
+        assert banned_ids_for_request([_THINK_END, _SPACE_BACKTICK, 2, 3], cfg) == []
 
     def test_stop_ignore_stays_reasoning_only(self):
         # Control: a sampled im_end after a merged backtick is never ignored.
@@ -173,7 +180,12 @@ class TestBacktickCitationIdsAllowed:
     ``</think>`` id mid-citation and ends think (screenshot: "Treat `"
     then nothing). Surgical rule — ban ``im_end`` and ``think_end``;
     keep ``think_start`` / tool ids sampleable for tool-tag citations.
+
+    The ban covers a two-token window so `` `\n</think>`` (production
+    chatcmpl-a2c610 / MTP) cannot clear the guard via a newline.
     """
+
+    _NEWLINE = 198
 
     def _cfg(self):
         req = MagicMock()
@@ -204,11 +216,33 @@ class TestBacktickCitationIdsAllowed:
         assert _THINK_END in banned
         assert _IM_END in banned
 
-    def test_ban_is_non_sticky(self):
-        # Control: one token later only the reasoning-phase im_end ban
-        # remains ([1, ...] is still mid-think).
+    def test_backtick_newline_still_bans_think_end(self):
+        """Regression chatcmpl-a2c610: `` `\n</think>`` mid-citation."""
+        banned = set(
+            banned_ids_for_request([1, _BACKTICK, self._NEWLINE], self._cfg())
+        )
+        assert _THINK_END in banned
+        assert _IM_END in banned
+
+    def test_merged_backtick_newline_still_bans_think_end(self):
+        banned = set(
+            banned_ids_for_request(
+                [1, _SPACE_BACKTICK, self._NEWLINE], self._cfg()
+            )
+        )
+        assert _THINK_END in banned
+        assert _IM_END in banned
+
+    def test_ban_sticky_one_token_then_reasoning_im_end_only(self):
+        # One token after backtick: still dangling (think_end + im_end).
         cfg = self._cfg()
-        assert banned_ids_for_request([1, _SPACE_BACKTICK, 2], cfg) == [_IM_END]
+        banned = set(banned_ids_for_request([1, _SPACE_BACKTICK, 2], cfg))
+        assert banned == {_IM_END, _THINK_END}
+
+    def test_ban_is_non_sticky_after_two_tokens(self):
+        # Two tokens later only the reasoning-phase im_end ban remains.
+        cfg = self._cfg()
+        assert banned_ids_for_request([1, _SPACE_BACKTICK, 2, 3], cfg) == [_IM_END]
 
     def test_stop_ignore_stays_reasoning_only(self):
         # Control: the backtick rule never rescues an already-sampled stop.
@@ -271,9 +305,12 @@ class TestThinkCitationAfterClose:
 
 
 class TestDanglingBacktick:
-    """The im_end ban must be non-sticky: only the single step right after
-    a lone `` ` `` token blocks stop. Parity counting deadlocks (BPE merges
-    hide one side of real spans) and caused endless ``!!!`` tails."""
+    """The im_end ban uses a two-token window after `` ` ``, not span parity.
+
+    Parity counting deadlocks (BPE merges hide one side of real spans) and
+    caused endless ``!!!`` tails. A one-token window let `` `\n</think>``
+    clear the guard; two tokens covers newline/MTP without sticking.
+    """
 
     def test_last_token_backtick_bans_im_end(self):
         ids = [_THINK_END, 1, _BACKTICK]
@@ -296,10 +333,31 @@ class TestDanglingBacktick:
             fence_id=_FENCE,
         )
 
+    def test_backtick_plus_one_still_dangling(self):
+        ids = [_THINK_END, 1, _BACKTICK, 2]
+        assert ends_with_dangling_backtick(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+            initial_reasoning=False,
+        )
+        assert should_ban_im_end(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            tool_start_id=_TOOL_START,
+            tool_end_id=_TOOL_END,
+            initial_reasoning=False,
+            backtick_id=_BACKTICK,
+            fence_id=_FENCE,
+        )
+
     def test_unpaired_backtick_earlier_does_not_stick(self):
         # Regression: odd count deep in the answer must NOT keep im_end
-        # banned once any other token followed (no parity deadlock).
-        ids = [_THINK_END, 1, _BACKTICK, 2]
+        # banned once two other tokens followed (no parity deadlock).
+        ids = [_THINK_END, 1, _BACKTICK, 2, 3]
         assert not ends_with_dangling_backtick(
             ids,
             think_start_id=_THINK_START,
@@ -456,8 +514,12 @@ class TestRequestWiring:
         }
         banned = set(banned_ids_for_request([_THINK_END, _BACKTICK], extra))
         assert {_IM_END, _THINK_END} <= banned
-        # Non-sticky: any token after the backtick re-allows both.
-        assert banned_ids_for_request([_THINK_END, _BACKTICK, 1], extra) == []
+        # Two-token window: one token after backtick still bans both.
+        assert {_IM_END, _THINK_END} <= set(
+            banned_ids_for_request([_THINK_END, _BACKTICK, 1], extra)
+        )
+        # Non-sticky: two tokens after the backtick re-allows both.
+        assert banned_ids_for_request([_THINK_END, _BACKTICK, 1, 2], extra) == []
 
     def test_should_ignore_stop_token_reasoning_only(self):
         """A sampled im_end is ignored only mid-think, never for backticks.
