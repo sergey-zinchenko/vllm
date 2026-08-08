@@ -33,6 +33,11 @@ from typing import Any
 QWEN_END_OF_TEXT = "<|endoftext|>"
 QWEN_IM_END = "<|im_end|>"
 QWEN_IM_START = "<|im_start|>"
+# Prose-spelled agent delimiters (BPE, not special ids) — ban + parser strip.
+QWEN_MASK_START = "<|mask_start|>"
+QWEN_MASK_END = "<|mask_end|>"
+QWEN_MASK_PAD = "<|mask_pad|>"
+QWEN_MASK_BAD_WORDS = (QWEN_MASK_START, QWEN_MASK_END, QWEN_MASK_PAD)
 
 # Default ChatML / Qwen special-token strings used for phase detection.
 _THINK_START = "<think>"
@@ -137,7 +142,7 @@ def apply_endoftext_ban_to_request(
     initial_reasoning: bool = True,
     vocab_cache_key: int | None = None,
 ) -> None:
-    """Ban ``<|endoftext|>`` and enable phase-aware ``im_end`` bans.
+    """Ban stop/mask prose markers and enable phase-aware ``im_end`` bans.
 
     Do **not** set ``logit_bias``: ``SamplingParams._validate_spec_decode``
     rejects it when MTP / speculative decoding is enabled (the qwen36-27b
@@ -146,16 +151,20 @@ def apply_endoftext_ban_to_request(
 
     ``vllm_xargs[qwen3_phase_ban]`` carries flattened ids for the builtin
     ``Qwen3PhaseStopLogitsProcessor`` / ``check_stop`` im_end masking.
+    Also sets ``qwen3_citation_nudge`` for text-path tag citations after
+    a dangling backtick. ``bad_words`` includes ``<|endoftext|>`` and
+    prose ``<|mask_*|>`` delimiters (model spells them in BPE).
     """
-    eot_id = resolve_endoftext_token_id(vocab)
-    if eot_id is not None:
-        bad_words = getattr(request, "bad_words", None)
-        if bad_words is None:
-            # ResponsesRequest has no bad_words field — skip quietly.
-            if hasattr(request, "bad_words"):
-                request.bad_words = [QWEN_END_OF_TEXT]
-        elif QWEN_END_OF_TEXT not in bad_words:
-            bad_words.append(QWEN_END_OF_TEXT)
+    ban_words = (QWEN_END_OF_TEXT, *QWEN_MASK_BAD_WORDS)
+    bad_words = getattr(request, "bad_words", None)
+    if bad_words is None:
+        # ResponsesRequest has no bad_words field — skip quietly.
+        if hasattr(request, "bad_words"):
+            request.bad_words = list(ban_words)
+    else:
+        for word in ban_words:
+            if word not in bad_words:
+                bad_words.append(word)
 
     im_end_id = resolve_im_end_token_id(vocab)
     if im_end_id is None:

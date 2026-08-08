@@ -11,6 +11,9 @@ from vllm.parser.qwen3_phase_stop import (
     PHASE_BAN_XARG_KEY,
     QWEN_END_OF_TEXT,
     QWEN_IM_END,
+    QWEN_MASK_BAD_WORDS,
+    QWEN_MASK_END,
+    QWEN_MASK_START,
     apply_endoftext_ban_to_request,
     banned_ids_for_request,
     ends_with_dangling_backtick,
@@ -551,6 +554,10 @@ class TestRequestWiring:
         apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
         assert req.logit_bias is None
         assert QWEN_END_OF_TEXT in req.bad_words
+        assert QWEN_MASK_START in req.bad_words
+        assert QWEN_MASK_END in req.bad_words
+        for word in QWEN_MASK_BAD_WORDS:
+            assert word in req.bad_words
         assert PHASE_BAN_XARG_KEY in req.vllm_xargs
         cfg = parse_phase_ban_config(req.vllm_xargs)
         assert cfg is not None

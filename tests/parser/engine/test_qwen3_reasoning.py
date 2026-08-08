@@ -2123,3 +2123,99 @@ class TestBacktickCitationHoldback:
         assert _fw_tag("<tool_call>") in out.reasoning
         assert out.content == "Answer."
         assert out.tool_calls == []
+
+
+class TestProseMaskDelimiterStrip:
+    """``<|mask_start|>`` / ``<|mask_end|>`` must not leak to the client.
+
+    Production chatcmpl-a8e4a9: model spelled mask delimiters in BPE around
+    ``</think>`` + tools; they appeared in the reasoning accordion and at
+    the start of the answer. Strip from reasoning/content; tools unchanged.
+    """
+
+    def test_mask_start_stripped_from_reasoning_before_answer(self, parser):
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "<|mask_start|>\n",
+                "</think>",
+                "\n\nAnswer follows.",
+            ],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+            ],
+        )
+        assert "<|mask_start|>" not in reasoning
+        assert "<|mask_end|>" not in reasoning
+        assert "<|mask_start|>" not in content
+        assert "Answer follows." in content
+
+    def test_mask_split_across_deltas_stripped(self, parser):
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "planning. <|mask",
+                "_start|>\n",
+                "</think>",
+                "\n\nDone.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert "planning." in reasoning
+        assert "mask" not in reasoning
+        assert "<|" not in reasoning
+        assert content.lstrip() == "Done."
+
+    def test_mask_end_after_tools_stripped_tools_still_emit(
+        self, mock_tokenizer, mock_request
+    ):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        from tests.parser.engine.streaming_helpers import (
+            collect_content,
+            collect_function_name,
+            simulate_tool_streaming,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        mock_request.tools = tools
+        parser = Qwen3Parser(mock_tokenizer, tools=tools)
+        chunks = [
+            "<|mask_start|>\n",
+            "</think>\n\n",
+            "<tool_call>\n",
+            "<function=get_weather>\n",
+            "<parameter=city>Tokyo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+            "<|mask_end|>",
+        ]
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+        assert collect_function_name(results) == "get_weather"
+        content = collect_content(results)
+        assert "<|mask_end|>" not in content
+        assert "<|mask_start|>" not in content
+        reasoning_parts = [
+            d.reasoning for d, _ in results if d and d.reasoning
+        ]
+        assert all("<|mask_start|>" not in (r or "") for r in reasoning_parts)

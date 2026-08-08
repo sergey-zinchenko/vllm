@@ -273,6 +273,8 @@ def qwen3_config(
         escape_structural_tags_in_prose=True,
         # Keep discussed stop markers as visible text instead of silent DROP.
         preserve_tokens=frozenset({QWEN_IM_END, QWEN_END_OF_TEXT}),
+        # Model sometimes spells agent mask delimiters in BPE around tools.
+        strip_prose_mask_delimiters=True,
     )
 
 
@@ -296,7 +298,9 @@ class Qwen3Parser(ParserEngine):
       citations without ``<parameter=`` flush back to content.
     - Only complete invokes whose name is in ``request.tools`` emit
       ``tool_calls``; invalid names flush as content.
-    - ``adjust_request`` bans ``<|endoftext|>`` for the whole turn.
+    - ``adjust_request`` bans ``<|endoftext|>`` and prose ``<|mask_*|>``
+      via ``bad_words``; the engine also strips residual mask delimiters
+      from reasoning/content.
 
     Subclasses that share the grammar but differ only in the four wrapper
     token strings (reasoning + tool-call) override the class attributes

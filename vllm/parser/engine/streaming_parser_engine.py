@@ -29,6 +29,14 @@ from vllm.parser.engine.token_id_scanner import (
     TokenIDScanner,
 )
 
+# Prose agent delimiters Qwen sometimes spells in BPE (not special ids).
+_PROSE_MASK_TAGS = (
+    "<|mask_start|>",
+    "<|mask_end|>",
+    "<|mask_pad|>",
+)
+_PROSE_MASK_MAX_HOLD = max(len(t) for t in _PROSE_MASK_TAGS) - 1
+
 
 @dataclass(slots=True)
 class _DropInfo:
@@ -213,6 +221,8 @@ class StreamingParserEngine:
         self._md_inline_closed_by_newline = False
         # Open <parameter=...> depth inside TOOL_ARGS (nested </tool_call>).
         self._param_depth = 0
+        # Cross-delta holdback for partial ``<|mask_*|>`` strip.
+        self._mask_holdback = ""
         self._reset_args_state()
 
     def feed(
@@ -271,6 +281,9 @@ class StreamingParserEngine:
 
         events.extend(self._process_lex_tokens(self._lexer.flush()))
 
+        # Incomplete ``<|mask…`` holdback is never a real suffix — drop it.
+        self._mask_holdback = ""
+
         if self._args_buffer:
             events.append(
                 SemanticEvent(
@@ -319,11 +332,14 @@ class StreamingParserEngine:
             events.append(
                 SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index)
             )
-            if self._think_end_pending_buffer:
+            pending = self._strip_prose_mask_delimiters(
+                self._think_end_pending_buffer
+            )
+            if pending:
                 events.append(
                     SemanticEvent(
                         EventType.TEXT_CHUNK,
-                        value=self._think_end_pending_buffer,
+                        value=pending,
                         tool_index=self.tool_index,
                     )
                 )
@@ -641,6 +657,7 @@ class StreamingParserEngine:
             self._reasoning_end_before_tool = False
             self.state = ParserState.REASONING
             raw = f"{marker}{think_ws}{preamble}"
+            raw = self._strip_prose_mask_delimiters(raw)
             text = self._escape_and_feed(raw)
             if not text:
                 return []
@@ -654,6 +671,7 @@ class StreamingParserEngine:
             ]
 
         self.state = ParserState.CONTENT
+        preamble = self._strip_prose_mask_delimiters(preamble)
         if not preamble:
             return []
         self._feed_markdown_state(preamble)
@@ -751,7 +769,7 @@ class StreamingParserEngine:
             text, after_broken_inline=after_broken
         ):
             self.state = ParserState.REASONING
-            raw = f"{marker}{buffered}{text}"
+            raw = self._strip_prose_mask_delimiters(f"{marker}{buffered}{text}")
             value = self._escape_and_feed(raw)
             # `` `\n</think>` ``: newline already closed the open span, so
             # the "closing" backtick re-opens inline in markdown state.
@@ -761,6 +779,8 @@ class StreamingParserEngine:
             if after_broken and check.startswith("`"):
                 self._md_inline_odd = False
                 self._md_inline_closed_by_newline = False
+            if not value:
+                return []
             self._note_reasoning_content(value)
             return [
                 SemanticEvent(
@@ -775,7 +795,7 @@ class StreamingParserEngine:
         events = [
             SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index),
         ]
-        content = f"{buffered}{text}"
+        content = self._strip_prose_mask_delimiters(f"{buffered}{text}")
         if not content:
             return events
         # Tool markup may arrive in the same content blob that confirms
@@ -799,6 +819,28 @@ class StreamingParserEngine:
             )
         )
         return events
+
+    def _strip_prose_mask_delimiters(self, text: str) -> str:
+        """Remove ``<|mask_*|>`` from prose; hold back partial tag prefixes."""
+        if not self.config.strip_prose_mask_delimiters:
+            return text
+        raw = f"{self._mask_holdback}{text}"
+        self._mask_holdback = ""
+        for tag in _PROSE_MASK_TAGS:
+            if tag in raw:
+                raw = raw.replace(tag, "")
+        if not raw:
+            return ""
+        hold_len = 0
+        max_hold = min(_PROSE_MASK_MAX_HOLD, len(raw))
+        for i in range(1, max_hold + 1):
+            suffix = raw[-i:]
+            if any(tag.startswith(suffix) for tag in _PROSE_MASK_TAGS):
+                hold_len = i
+        if hold_len:
+            self._mask_holdback = raw[-hold_len:]
+            raw = raw[:-hold_len]
+        return raw
 
     def _emit_for_state(self, text: str) -> list[SemanticEvent]:
         if self.state == ParserState.MESSAGE_HEADER:
@@ -825,6 +867,10 @@ class StreamingParserEngine:
             ]
         content_type = self.config.content_events.get(self.state)
         if content_type is not None:
+            if content_type in (EventType.REASONING_CHUNK, EventType.TEXT_CHUNK):
+                text = self._strip_prose_mask_delimiters(text)
+                if not text:
+                    return []
             if content_type == EventType.REASONING_CHUNK:
                 text = self._escape_and_feed(text)
                 self._note_reasoning_content(text)

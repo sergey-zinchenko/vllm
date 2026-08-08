@@ -113,6 +113,11 @@ class ParserEngineConfig:
     # do not render empty HTML widgets for raw ``<tool_call>`` etc.
     escape_structural_tags_in_prose: bool = False
 
+    # Strip prose ``<|mask_start|>`` / ``<|mask_end|>`` (and pad) from
+    # reasoning/content emits. Qwen sometimes spells these in BPE around
+    # tool turns; they are not FSM terminals.
+    strip_prose_mask_delimiters: bool = False
+
     @cached_property
     def terminal_defs(self):
         from vllm.parser.engine.incremental_lexer import terminals_from_literals
