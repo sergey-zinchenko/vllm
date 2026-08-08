@@ -1038,12 +1038,29 @@ class TestMarkdownInertStructuralTags:
         return Qwen3Parser(mock_tokenizer, tools=tools)
 
     def test_backticked_think_end_stays_reasoning(self, parser):
+        """Text/BPE `` `</think>` `` citation must stay in reasoning."""
         text = "docs say `</think>` closes think but this is a citation."
         reasoning, content = parser.extract_reasoning(text, None)
         assert content is None or content == ""
         assert reasoning is not None
         assert "docs say" in reasoning
         assert "closes think" in reasoning
+        _assert_tag_visible(reasoning, "</think>")
+
+    def test_streaming_text_backticked_think_end_stays_reasoning(self, parser):
+        """Streaming text-form citation (no special id) stays in reasoning."""
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            ["docs say `", "</think>", "` closes think."],
+            [
+                (1,),
+                (2,),  # text match only — not _THINK_END_ID
+                (3,),
+            ],
+        )
+        assert content == ""
+        assert "docs say" in reasoning
+        assert "closes think." in reasoning
         _assert_tag_visible(reasoning, "</think>")
 
     def test_backticked_tool_call_pr_title_stays_reasoning(self, parser):
@@ -1095,20 +1112,63 @@ class TestMarkdownInertStructuralTags:
         _assert_tag_visible(reasoning, "</think>")
         assert "discussion continues" in reasoning
 
-    def test_streaming_backticked_think_end(self, parser):
+    def test_streaming_inline_special_think_end_exits_to_content(self, parser):
+        """Special ``</think>`` inside open `` ` `` must leave reasoning.
+
+        Production chatcmpl-892494: model cited the tag after an opening
+        backtick; markdown-inert fullwidth kept the FSM in REASONING while
+        the sampler latch closed think — entire answer streamed as reasoning.
+        Special-id TE in code force-commits; closing `` ` `` + Uppercase
+        answer must land in content.
+        """
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["docs say `", "</think>", "` closes think."],
+            [
+                "before `",
+                "</think>",
+                "`",
+                "\n\nAnswer follows.",
+            ],
             [
                 (1,),
                 (_THINK_END_ID,),
                 (2,),
+                (3,),
             ],
         )
-        assert content == ""
-        assert "docs say" in reasoning
-        assert "closes think." in reasoning
-        _assert_tag_visible(reasoning, "</think>")
+        assert "before" in reasoning
+        assert "Answer follows." in content
+        assert "Answer follows." not in reasoning
+        assert "＜/think＞" not in reasoning
+        assert "&lt;/think&gt;" not in reasoning
+
+    def test_streaming_inline_special_think_end_citation_tail_to_content(
+        self, parser
+    ):
+        """Same-delta closing `` `), and…`` after special TE still commits.
+
+        Sticky would treat the closing backtick as false continuation and
+        swallow the rest of the turn into reasoning (892494 shape).
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "before `",
+                "</think>",
+                "`), and the standard parser continues.\n\n",
+                "Всё, ответ готов.",
+            ],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+                (3,),
+            ],
+        )
+        assert "before" in reasoning
+        assert "Всё, ответ готов." in content
+        assert "Всё, ответ готов." not in reasoning
+        assert "＜/think＞" not in reasoning
 
     def test_dangling_backtick_before_think_end_still_emits_tool(
         self, parser_with_tools, mock_request
@@ -1472,13 +1532,18 @@ class TestMidReasoningCitations:
         assert "&lt;" not in reasoning
 
     def test_code_span_cited_think_end_raw(self, parser):
+        """Text-form `` `</think>` `` stays reasoning as fullwidth prose.
+
+        Special-id TE inside an open span force-commits (see inline special
+        TE tests); citations must use text/BPE.
+        """
         reasoning, content = simulate_reasoning_streaming(
             parser,
             ["docs say `", "</think>", "` closes think."],
             [
                 (1,),
-                (_THINK_END_ID,),
-                (2,),
+                (2,),  # text match — not _THINK_END_ID
+                (3,),
             ],
         )
         assert content == ""
@@ -1605,16 +1670,17 @@ class TestMarkdownAnswerAfterThinkEnd:
         assert "</think>" not in reasoning
 
     def test_control_code_span_citation_stays_reasoning(self, parser):
-        # GREEN control: `` `</think>` `` inside backticks is a citation.
+        # GREEN control: text-form `` `</think>` `` citation stays in reasoning.
+        # Special-id TE in an open span would force-commit instead.
         reasoning, content = simulate_reasoning_streaming(
             parser,
             ["tag `", "</think>", "` cited. ", "</think>", "Answer."],
             [
                 (1,),
-                (_THINK_END_ID,),
-                (2,),
-                (_THINK_END_ID,),
+                (2,),  # text citation
                 (3,),
+                (_THINK_END_ID,),
+                (4,),
             ],
         )
         assert content == "Answer."

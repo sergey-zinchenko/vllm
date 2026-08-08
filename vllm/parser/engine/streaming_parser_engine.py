@@ -191,6 +191,10 @@ class StreamingParserEngine:
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
         self._think_end_pending_after_broken_inline = False
+        # Special-id ``</think>`` while inside `` `...` `` / ```...```: commit
+        # on the next non-empty text (do not sticky-abort). Citations must use
+        # text/BPE, not the special id (phase-ban also tries to block this).
+        self._think_end_pending_force_commit = False
         self._answer_content_started = False
         # True after the first non-whitespace REASONING_CHUNK. Distinguishes
         # the template leading ``<think>`` (still stripped) from a mid-think
@@ -253,7 +257,11 @@ class StreamingParserEngine:
         for item in items:
             if isinstance(item, PreLexedTerminal):
                 events.extend(self._process_lex_tokens(self._lexer.flush()))
-                events.extend(self._on_terminal(item.terminal, item.text))
+                events.extend(
+                    self._on_terminal(
+                        item.terminal, item.text, from_special_id=True
+                    )
+                )
             elif isinstance(item, TextChunk):
                 events.extend(self._process_lex_tokens(self._lexer.feed(item.text)))
         return events
@@ -493,23 +501,32 @@ class StreamingParserEngine:
         """Update inline-backtick / fenced-code state from emitted text."""
         self._escape_and_feed(text, escape=False)
 
-    def _on_terminal(self, terminal: str, value: str) -> list[SemanticEvent]:
+    def _on_terminal(
+        self,
+        terminal: str,
+        value: str,
+        *,
+        from_special_id: bool = False,
+    ) -> list[SemanticEvent]:
         key = (self.state, terminal)
         transition = self.config.transitions.get(key)
         text = self._terminal_text(terminal, value)
+        in_markdown_code = self._in_markdown_code()
 
         if self._has_drops and terminal == DROP_TERMINAL and transition is None:
             return []
 
         # Inside markdown code: structural tags are inert prose — except
-        # THINK_END in an open fence. An unclosed ``` would otherwise
-        # swallow every later </think> special (production chatcmpl-86dedb:
-        # answer stuck in reasoning with fullwidth ＜/think＞). Inline
-        # `` `...` `` citations stay inert.
+        # THINK_END (fence and inline). An unclosed ``` or open `` ` ``
+        # would otherwise swallow ``</think>`` as fullwidth code prose and
+        # leave the answer stuck in reasoning (chatcmpl-86dedb fence;
+        # chatcmpl-892494 inline citation of the special id). Text/BPE
+        # `` `</think>` `` citations still go through THINK_END_PENDING
+        # sticky; special-id TE in code force-commits (see below).
         if (
-            self._in_markdown_code()
+            in_markdown_code
             and self._is_structural_terminal(terminal)
-            and not (terminal == "THINK_END" and self._md_in_fence)
+            and terminal != "THINK_END"
         ):
             return self._emit_for_state(text)
 
@@ -577,6 +594,17 @@ class StreamingParserEngine:
             self._param_depth += 1
         elif self.state == ParserState.TOOL_ARGS and terminal == "PARAM_END":
             self._param_depth = max(0, self._param_depth - 1)
+
+        # Special-id TE inside markdown code: next non-empty text commits.
+        # Sticky abort would put the whole answer back into reasoning
+        # (chatcmpl-892494: ``before `</think>`), and…``).
+        if (
+            terminal == "THINK_END"
+            and from_special_id
+            and in_markdown_code
+            and self.state == ParserState.REASONING
+        ):
+            self._think_end_pending_force_commit = True
 
         return self._apply_transition(transition, text)
 
@@ -694,6 +722,7 @@ class StreamingParserEngine:
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
         self._think_end_pending_after_broken_inline = False
+        self._think_end_pending_force_commit = False
         self._md_inline_closed_by_newline = False
 
     def _clear_markdown_code_state(self) -> None:
@@ -715,9 +744,10 @@ class StreamingParserEngine:
         marker = self._terminal_text("THINK_END", self._think_end_marker)
         buffered = self._think_end_pending_buffer
         after_broken = self._think_end_pending_after_broken_inline
+        force_commit = self._think_end_pending_force_commit
         self._clear_think_end_pending_flags()
 
-        if self._is_false_think_end_continuation(
+        if not force_commit and self._is_false_think_end_continuation(
             text, after_broken_inline=after_broken
         ):
             self.state = ParserState.REASONING
