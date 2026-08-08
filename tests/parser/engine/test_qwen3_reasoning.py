@@ -1271,6 +1271,64 @@ class TestMarkdownInertStructuralTags:
         assert "Still planning." not in content
         assert content.lstrip() == "Answer."
 
+    def test_newline_broken_think_end_backtick_period_stays_reasoning(self, parser):
+        """`` `\n</think>`. Sometimes… `` must stay in reasoning (83c0df95…).
+
+        Production: after ``Qwen3 uses `\n``, special ``</think>`` then
+        `` `.`` committed the end — CoT (``Sometimes models emit…``) leaked
+        into content until a later real ``</think>``.
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "Double check the `<endoftext>` token. Qwen3 uses ",
+                "`\n",
+                "</think>",
+                "`. Sometimes models emit. Still planning.",
+                "</think>",
+                "\n\nFinal answer.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+                (_THINK_END_ID,),
+                (4,),
+            ],
+        )
+        assert "Sometimes models emit" in reasoning
+        assert "Still planning." in reasoning
+        assert "Sometimes models emit" not in content
+        assert "Still planning." not in content
+        assert content.lstrip() == "Final answer."
+
+    def test_newline_broken_think_end_backtick_period_same_delta(self, parser):
+        """Same-delta ``</think>`.`` (prod ``[248069, 27653]`` → `` `.``)."""
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "Qwen3 uses ",
+                "`\n",
+                "</think>`.",
+                " Sometimes models emit `<|endoftext|>`. Still planning.",
+                "</think>",
+                "\n\nFinal answer.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID, 3),
+                (4,),
+                (_THINK_END_ID,),
+                (5,),
+            ],
+        )
+        assert "Sometimes models emit" in reasoning
+        assert "Still planning." in reasoning
+        assert "Sometimes models emit" not in content
+        assert content.lstrip() == "Final answer."
+
 
 class TestMidReasoningCitations:
     """Cited think tags mid-reasoning must never leave holes.
