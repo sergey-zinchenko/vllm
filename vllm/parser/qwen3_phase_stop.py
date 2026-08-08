@@ -57,7 +57,8 @@ _FENCE_BACKTICK = "```"
 # tokens whose text ends with one backtick. Legacy configs without paren
 # slots still parse (paren None, trailing from index 8).
 PHASE_BAN_XARG_KEY = "qwen3_phase_ban"
-# Separate from phase_ban packing: [lt_id, lt_slash_id_or_-1, bang_id_or_-1].
+# Separate from phase_ban packing:
+# [lt_id, lt_slash_id_or_-1, bang_id_or_-1, newline_id_or_-1?].
 CITATION_NUDGE_XARG_KEY = "qwen3_citation_nudge"
 
 _CLOSE_PAREN = ")"
@@ -65,10 +66,15 @@ _OPEN_PAREN = "("
 _LT = "<"
 _LT_SLASH = "</"
 _BANG = "!"
+_NEWLINE = "\n"
 
 # Soft logits nudge after a dangling opening `` ` `` (text-path citations).
 CITATION_LT_BOOST = 4.0
-CITATION_BANG_PENALTY = 8.0
+# Soft boost for ``im_end`` once a bang/newline streak is detected after
+# think has closed (break ``!\n!\n`` attractors without force-argmax).
+BANG_STREAK_IM_END_BOOST = 8.0
+BANG_STREAK_MIN_LEN = 4
+BANG_STREAK_MIN_BANGS = 2
 
 PhaseBanConfig = tuple[
     int,
@@ -191,6 +197,7 @@ def apply_endoftext_ban_to_request(
         _id(_LT),
         _id(_LT_SLASH),
         _id(_BANG),
+        _id(_NEWLINE),
     ]
     xargs = getattr(request, "vllm_xargs", None)
     if xargs is None:
@@ -311,7 +318,8 @@ def ends_with_dangling_backtick(
     never tokenize as the bare backtick, and the truncation happens right
     after those merged forms.     Applies inside reasoning too: the ban covers ``im_end`` and all
     structural specials (think/tool); citations must use text/BPE, with
-    a soft ``<`` / ``</`` boost (see ``step_citation_logit_deltas``).
+    a soft ``<`` / ``</`` boost and a hard ``!`` ban (see
+    ``step_citation_logit_deltas`` / ``step_banned_ids``).
 
     Deliberately **not** span parity: counting one vocab id sees only one
     side of real inline spans, sticks odd, and bans ``im_end`` for the
@@ -330,6 +338,36 @@ def ends_with_dangling_backtick(
     if _is_backtick(output_token_ids[-1]):
         return True
     return len(output_token_ids) >= 2 and _is_backtick(output_token_ids[-2])
+
+
+def ends_with_bang_newline_streak(
+    output_token_ids: Sequence[int],
+    *,
+    bang_id: int | None,
+    newline_id: int | None,
+    min_len: int = BANG_STREAK_MIN_LEN,
+    min_bangs: int = BANG_STREAK_MIN_BANGS,
+) -> bool:
+    """True when the suffix is a ``!`` / ``\\n`` attractor (prod ``!\n!\n``).
+
+    Requires at least *min_len* trailing tokens from ``{bang, newline}`` and
+    at least *min_bangs* bangs so ordinary ``!`` / ``!\\n`` punctuation is
+    untouched.
+    """
+    if bang_id is None or not output_token_ids:
+        return False
+    allowed = {bang_id}
+    if newline_id is not None:
+        allowed.add(newline_id)
+    n = 0
+    bangs = 0
+    for tid in reversed(output_token_ids):
+        if tid not in allowed:
+            break
+        n += 1
+        if tid == bang_id:
+            bangs += 1
+    return n >= min_len and bangs >= min_bangs
 
 
 def should_ban_im_end(
@@ -379,6 +417,8 @@ def step_banned_ids(
     trailing_backtick_ids: frozenset[int] = frozenset(),
     close_paren_id: int | None = None,
     open_paren_id: int | None = None,
+    bang_id: int | None = None,
+    newline_id: int | None = None,
 ) -> list[int]:
     """Token ids banned for the next decode step.
 
@@ -386,10 +426,12 @@ def step_banned_ids(
     - reasoning phase: ``im_end`` banned while inside the think block;
     - after think latch (not in reasoning): ``think_end`` banned forever
       so mid-answer citations / MTP cannot sample another special close;
-    - dangling backtick: ``im_end`` and all structural specials
-      (``think_start`` / ``think_end`` / ``tool_start`` / ``tool_end``)
-      banned for a two-token window — citations must use text/BPE
-      (covers `` `\n</think>`` / ``Treat `\n!``);
+    - dangling backtick: ``im_end``, all structural specials
+      (``think_start`` / ``think_end`` / ``tool_start`` / ``tool_end``),
+      and ``!`` banned for a two-token window — citations must use
+      text/BPE (covers `` `\n</think>`` / ``Treat `\n!``);
+    - bang/newline streak: ``!`` hard-banned (does not touch ``think_end``)
+      so ``!\n!\n`` attractors cannot run to ``max_tokens``;
     - empty start (no output yet, initial reasoning): ``think_end`` and
       bare ``)`` / ``(`` banned so polluted history cannot open with a
       lone paren or instantly close think.
@@ -412,6 +454,11 @@ def step_banned_ids(
         initial_reasoning=initial_reasoning,
         trailing_backtick_ids=trailing_backtick_ids,
     )
+    streak = ends_with_bang_newline_streak(
+        output_token_ids,
+        bang_id=bang_id,
+        newline_id=newline_id,
+    )
     if im_end_id is not None and (in_reasoning or dangling):
         banned.append(im_end_id)
     if dangling:
@@ -420,9 +467,12 @@ def step_banned_ids(
             think_end_id,
             tool_start_id,
             tool_end_id,
+            bang_id,
         ):
             if tid is not None and tid not in banned:
                 banned.append(tid)
+    if streak and bang_id is not None and bang_id not in banned:
+        banned.append(bang_id)
     # One-way latch: after the first think close appears in output, never
     # sample think_end again (chatcmpl-8b9c: ``Treat `\n</think>`` mid-answer).
     # Require a seen think_end so content-only turns (initial_reasoning=False)
@@ -455,16 +505,22 @@ def step_citation_logit_deltas(
     lt_id: int | None = None,
     lt_slash_id: int | None = None,
     bang_id: int | None = None,
+    newline_id: int | None = None,
+    im_end_id: int | None = None,
+    tool_start_id: int | None = None,
+    tool_end_id: int | None = None,
     lt_boost: float = CITATION_LT_BOOST,
-    bang_penalty: float = CITATION_BANG_PENALTY,
+    im_end_boost: float = BANG_STREAK_IM_END_BOOST,
 ) -> list[tuple[int, float]]:
-    """Finite logit deltas for text-path tag citations after `` ` ``.
+    """Finite logit deltas for citation text-path and bang-loop breakout.
 
-    Active only in the dangling-backtick window. Boosts ``<`` / ``</`` so
-    the model spells tags in BPE instead of sampling banned specials or
-    falling through to ``!`` (production ``Treat `\n!``).
+    - Dangling backtick: boost ``<`` / ``</`` so tags spell in BPE.
+      ``!`` is hard-banned separately (soft penalty was not enough for
+      production ``Treat `\n!`` → ``!\n!\n``).
+    - Bang/newline streak after think close: soft-boost ``im_end``.
     """
-    if not ends_with_dangling_backtick(
+    deltas: list[tuple[int, float]] = []
+    if ends_with_dangling_backtick(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
@@ -473,21 +529,38 @@ def step_citation_logit_deltas(
         initial_reasoning=initial_reasoning,
         trailing_backtick_ids=trailing_backtick_ids,
     ):
-        return []
-    deltas: list[tuple[int, float]] = []
-    if lt_id is not None:
-        deltas.append((lt_id, lt_boost))
-    if lt_slash_id is not None and lt_slash_id != lt_id:
-        deltas.append((lt_slash_id, lt_boost))
-    if bang_id is not None:
-        deltas.append((bang_id, -bang_penalty))
+        if lt_id is not None:
+            deltas.append((lt_id, lt_boost))
+        if lt_slash_id is not None and lt_slash_id != lt_id:
+            deltas.append((lt_slash_id, lt_boost))
+    if (
+        im_end_id is not None
+        and ends_with_bang_newline_streak(
+            output_token_ids,
+            bang_id=bang_id,
+            newline_id=newline_id,
+        )
+        and not is_in_reasoning_or_tool_phase(
+            output_token_ids,
+            think_start_id=think_start_id,
+            think_end_id=think_end_id,
+            tool_start_id=tool_start_id,
+            tool_end_id=tool_end_id,
+            initial_reasoning=initial_reasoning,
+        )
+    ):
+        deltas.append((im_end_id, im_end_boost))
     return deltas
 
 
 def parse_citation_nudge_config(
     extra_args: Mapping[str, Any] | None,
-) -> tuple[int | None, int | None, int | None] | None:
-    """Parse ``qwen3_citation_nudge`` → ``(lt_id, lt_slash_id, bang_id)``."""
+) -> tuple[int | None, int | None, int | None, int | None] | None:
+    """Parse ``qwen3_citation_nudge``.
+
+    Returns ``(lt_id, lt_slash_id, bang_id, newline_id)``. ``newline_id`` is
+    optional (legacy 3-field configs → ``None``).
+    """
     if not extra_args:
         return None
     raw = extra_args.get(CITATION_NUDGE_XARG_KEY)
@@ -498,7 +571,8 @@ def parse_citation_nudge_config(
         i = int(v)
         return i if i >= 0 else None
 
-    return _opt(raw[0]), _opt(raw[1]), _opt(raw[2])
+    newline_id = _opt(raw[3]) if len(raw) > 3 else None
+    return _opt(raw[0]), _opt(raw[1]), _opt(raw[2]), newline_id
 
 
 def phase_banned_token_ids(
@@ -534,6 +608,8 @@ def phase_banned_token_ids(
             trailing_backtick_ids=frozenset(trailing_backtick_token_ids(vocab)),
             close_paren_id=resolve_vocab_token_id(vocab, _CLOSE_PAREN),
             open_paren_id=resolve_vocab_token_id(vocab, _OPEN_PAREN),
+            bang_id=resolve_vocab_token_id(vocab, _BANG),
+            newline_id=resolve_vocab_token_id(vocab, _NEWLINE),
         )
     )
     return banned
@@ -573,6 +649,10 @@ def banned_ids_for_request(
         open_paren_id,
         trailing_backtick_ids,
     ) = cfg
+    nudge = parse_citation_nudge_config(extra_args)
+    bang_id = newline_id = None
+    if nudge is not None:
+        _lt, _lt_slash, bang_id, newline_id = nudge
     return step_banned_ids(
         output_token_ids,
         im_end_id=im_end_id,
@@ -586,6 +666,8 @@ def banned_ids_for_request(
         trailing_backtick_ids=trailing_backtick_ids,
         close_paren_id=close_paren_id,
         open_paren_id=open_paren_id,
+        bang_id=bang_id,
+        newline_id=newline_id,
     )
 
 

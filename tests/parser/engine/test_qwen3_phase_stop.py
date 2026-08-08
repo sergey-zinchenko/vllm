@@ -5,7 +5,7 @@
 from unittest.mock import MagicMock
 
 from vllm.parser.qwen3_phase_stop import (
-    CITATION_BANG_PENALTY,
+    BANG_STREAK_IM_END_BOOST,
     CITATION_LT_BOOST,
     CITATION_NUDGE_XARG_KEY,
     PHASE_BAN_XARG_KEY,
@@ -16,6 +16,7 @@ from vllm.parser.qwen3_phase_stop import (
     QWEN_MASK_START,
     apply_endoftext_ban_to_request,
     banned_ids_for_request,
+    ends_with_bang_newline_streak,
     ends_with_dangling_backtick,
     is_in_reasoning_or_tool_phase,
     parse_citation_nudge_config,
@@ -42,6 +43,7 @@ _OPEN_PAREN = 46
 _LT = 50
 _LT_SLASH = 51
 _BANG = 0
+_NEWLINE = 198
 
 
 _VOCAB = {
@@ -63,6 +65,7 @@ _VOCAB = {
     "<": _LT,
     "</": _LT_SLASH,
     "!": _BANG,
+    "\n": _NEWLINE,
 }
 
 _STRUCTURAL_SPECIALS = {
@@ -197,14 +200,14 @@ class TestMergedBacktickStopGuard:
 
 
 class TestBacktickCitationIdsAllowed:
-    """Dangling backtick bans all structural specials + ``im_end``.
+    """Dangling backtick bans all structural specials + ``im_end`` + ``!``.
 
     Citations must use text/BPE (soft ``<`` / ``</`` boost); specials after
     `` ` `` caused early think-close / ``Treat `\n!`` when TE was banned
     alone. Two-token window still covers `` `\n</think>`` (MTP).
     """
 
-    _NEWLINE = 198
+    _DANGLING = _STRUCTURAL_SPECIALS | {_IM_END, _BANG}
 
     def _cfg(self):
         req = MagicMock()
@@ -216,12 +219,12 @@ class TestBacktickCitationIdsAllowed:
 
     def test_reasoning_backtick_bans_all_structural_specials(self):
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
+        assert self._DANGLING <= banned
 
     def test_answer_backtick_bans_all_structural_specials(self):
         ids = [_THINK_END, 1, _SPACE_BACKTICK]
         banned = set(banned_ids_for_request(ids, self._cfg()))
-        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
+        assert self._DANGLING <= banned
 
     def test_lone_backtick_bans_tool_ids(self):
         banned = set(banned_ids_for_request([1, _BACKTICK], self._cfg()))
@@ -229,27 +232,26 @@ class TestBacktickCitationIdsAllowed:
         assert _TOOL_END in banned
         assert _THINK_END in banned
         assert _IM_END in banned
+        assert _BANG in banned
 
     def test_backtick_newline_still_bans_specials(self):
         """Regression chatcmpl-a2c610: `` `\n</think>`` mid-citation."""
         banned = set(
-            banned_ids_for_request([1, _BACKTICK, self._NEWLINE], self._cfg())
+            banned_ids_for_request([1, _BACKTICK, _NEWLINE], self._cfg())
         )
-        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
+        assert self._DANGLING <= banned
 
     def test_merged_backtick_newline_still_bans_specials(self):
         banned = set(
-            banned_ids_for_request(
-                [1, _SPACE_BACKTICK, self._NEWLINE], self._cfg()
-            )
+            banned_ids_for_request([1, _SPACE_BACKTICK, _NEWLINE], self._cfg())
         )
-        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
+        assert self._DANGLING <= banned
 
     def test_ban_sticky_one_token_then_all_specials(self):
         # One token after backtick: still dangling.
         cfg = self._cfg()
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK, 2], cfg))
-        assert banned == _STRUCTURAL_SPECIALS | {_IM_END}
+        assert banned == self._DANGLING
 
     def test_ban_is_non_sticky_after_two_tokens(self):
         # Two tokens later only the reasoning-phase im_end ban remains.
@@ -259,7 +261,7 @@ class TestBacktickCitationIdsAllowed:
     def test_tools_allowed_again_after_window(self):
         cfg = self._cfg()
         banned = set(banned_ids_for_request([_THINK_END, 1, _SPACE_BACKTICK, 2, 3], cfg))
-        assert banned.isdisjoint({_TOOL_START, _TOOL_END, _THINK_START})
+        assert banned.isdisjoint({_TOOL_START, _TOOL_END, _THINK_START, _BANG})
         assert _THINK_END in banned  # post-close latch
         assert _IM_END not in banned
 
@@ -272,9 +274,7 @@ class TestBacktickCitationIdsAllowed:
 
 
 class TestCitationTextPathNudge:
-    """Soft ``<`` / ``</`` boost and ``!`` penalty only while dangling."""
-
-    _NEWLINE = 198
+    """Soft ``<`` / ``</`` boost while dangling; ``!`` is hard-banned."""
 
     def _nudge_ids(self):
         req = MagicMock()
@@ -286,10 +286,17 @@ class TestCitationTextPathNudge:
         return parse_citation_nudge_config(req.vllm_xargs)
 
     def test_apply_sets_citation_nudge_xarg(self):
-        lt, lt_slash, bang = self._nudge_ids()
+        lt, lt_slash, bang, newline = self._nudge_ids()
         assert lt == _LT
         assert lt_slash == _LT_SLASH
         assert bang == _BANG
+        assert newline == _NEWLINE
+
+    def test_parse_legacy_three_field_nudge(self):
+        cfg = parse_citation_nudge_config(
+            {CITATION_NUDGE_XARG_KEY: [_LT, _LT_SLASH, _BANG]}
+        )
+        assert cfg == (_LT, _LT_SLASH, _BANG, None)
 
     def test_deltas_active_when_dangling(self):
         deltas = dict(
@@ -303,11 +310,31 @@ class TestCitationTextPathNudge:
                 lt_id=_LT,
                 lt_slash_id=_LT_SLASH,
                 bang_id=_BANG,
+                newline_id=_NEWLINE,
             )
         )
         assert deltas[_LT] == CITATION_LT_BOOST
         assert deltas[_LT_SLASH] == CITATION_LT_BOOST
-        assert deltas[_BANG] == -CITATION_BANG_PENALTY
+        assert _BANG not in deltas
+
+    def test_dangling_hard_bans_bang(self):
+        banned = set(
+            step_banned_ids(
+                [1, _SPACE_BACKTICK],
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert _BANG in banned
 
     def test_deltas_empty_when_not_dangling(self):
         assert (
@@ -321,14 +348,15 @@ class TestCitationTextPathNudge:
                 lt_id=_LT,
                 lt_slash_id=_LT_SLASH,
                 bang_id=_BANG,
+                newline_id=_NEWLINE,
             )
             == []
         )
 
     def test_spec_row_after_backtick_newline_bans_tool_and_think_end(self):
-        """MTP: draft ``[` , \\n, TE]`` bans TE + tool_start on dangling rows."""
+        """MTP: draft ``[` , \\n, TE]`` bans TE + tool_start + bang."""
         accepted = [_THINK_END, 18307]
-        draft = [_SPACE_BACKTICK, self._NEWLINE, _THINK_END]
+        draft = [_SPACE_BACKTICK, _NEWLINE, _THINK_END]
         banned = set(
             step_banned_ids(
                 accepted + draft[:2],
@@ -341,9 +369,11 @@ class TestCitationTextPathNudge:
                 backtick_id=_BACKTICK,
                 fence_id=_FENCE,
                 trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
             )
         )
-        assert {_THINK_END, _TOOL_START, _IM_END} <= banned
+        assert {_THINK_END, _TOOL_START, _IM_END, _BANG} <= banned
         deltas = dict(
             step_citation_logit_deltas(
                 accepted + draft[:1],
@@ -355,10 +385,116 @@ class TestCitationTextPathNudge:
                 lt_id=_LT,
                 lt_slash_id=_LT_SLASH,
                 bang_id=_BANG,
+                newline_id=_NEWLINE,
             )
         )
         assert _LT in deltas
-        assert deltas[_BANG] < 0
+        assert _BANG not in deltas
+
+
+class TestBangNewlineStreak:
+    """Anti-loop for production ``!\n!\n`` after dangling backtick."""
+
+    def test_streak_detector_requires_min_len_and_bangs(self):
+        assert not ends_with_bang_newline_streak(
+            [_BANG], bang_id=_BANG, newline_id=_NEWLINE
+        )
+        assert not ends_with_bang_newline_streak(
+            [_BANG, _NEWLINE], bang_id=_BANG, newline_id=_NEWLINE
+        )
+        assert not ends_with_bang_newline_streak(
+            [_BANG, _NEWLINE, _BANG], bang_id=_BANG, newline_id=_NEWLINE
+        )
+        assert ends_with_bang_newline_streak(
+            [_BANG, _NEWLINE, _BANG, _NEWLINE],
+            bang_id=_BANG,
+            newline_id=_NEWLINE,
+        )
+
+    def test_streak_bans_bang_not_think_end(self):
+        ids = [_THINK_END, 1, _BANG, _NEWLINE, _BANG, _NEWLINE]
+        banned = set(
+            step_banned_ids(
+                ids,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert _BANG in banned
+        # Post-latch still bans TE; streak must not add extra structural bans.
+        assert banned == {_BANG, _THINK_END}
+
+    def test_streak_after_think_close_boosts_im_end(self):
+        ids = [_THINK_END, 1, _BANG, _NEWLINE, _BANG, _NEWLINE]
+        deltas = dict(
+            step_citation_logit_deltas(
+                ids,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                backtick_id=_BACKTICK,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+                im_end_id=_IM_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+            )
+        )
+        assert deltas[_IM_END] == BANG_STREAK_IM_END_BOOST
+
+    def test_streak_in_reasoning_does_not_boost_im_end(self):
+        ids = [1, _BANG, _NEWLINE, _BANG, _NEWLINE]
+        deltas = step_citation_logit_deltas(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            bang_id=_BANG,
+            newline_id=_NEWLINE,
+            im_end_id=_IM_END,
+            initial_reasoning=True,
+        )
+        assert deltas == []
+        banned = set(
+            step_banned_ids(
+                ids,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert _BANG in banned
+        assert _THINK_END not in banned
+        assert _IM_END in banned
+
+    def test_short_bang_punctuation_not_banned(self):
+        for ids in ([_THINK_END, 1, _BANG], [_THINK_END, 1, _BANG, _NEWLINE]):
+            banned = set(
+                step_banned_ids(
+                    ids,
+                    im_end_id=_IM_END,
+                    think_start_id=_THINK_START,
+                    think_end_id=_THINK_END,
+                    tool_start_id=_TOOL_START,
+                    tool_end_id=_TOOL_END,
+                    initial_reasoning=True,
+                    bang_id=_BANG,
+                    newline_id=_NEWLINE,
+                )
+            )
+            assert _BANG not in banned
 
 
 class TestThinkCitationAfterClose:

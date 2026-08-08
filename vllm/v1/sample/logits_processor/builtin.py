@@ -318,14 +318,15 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
     to ``-inf``. After think closes, odd single-backtick token parity also
     bans ``im_end`` (unclosed inline code span). Open tool markup does not
     ban stop (prose citations of ``<tool_call>`` must remain stoppable).
-    After a dangling `` ` ``, all structural specials are banned and
-    text-tag openers (``<`` / ``</``) get a soft boost. Works with
-    speculative decoding via :meth:`apply_with_spec_decode`.
+    After a dangling `` ` ``, all structural specials and ``!`` are banned
+    and text-tag openers (``<`` / ``</``) get a soft boost. A bang/newline
+    streak hard-bans ``!`` and soft-boosts ``im_end`` after think closes.
+    Works with speculative decoding via :meth:`apply_with_spec_decode`.
     """
 
     # (im_end, out_ids, think_start, think_end, tool_start, tool_end,
     #  initial, backtick, fence, close_paren, open_paren, trailing,
-    #  lt_id, lt_slash_id, bang_id)
+    #  lt_id, lt_slash_id, bang_id, newline_id)
     _ReqState = tuple[
         int,
         Sequence[int],
@@ -339,6 +340,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         int | None,
         int | None,
         frozenset[int],
+        int | None,
         int | None,
         int | None,
         int | None,
@@ -386,9 +388,9 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             trailing_backtick_ids,
         ) = cfg
         nudge = self._parse_citation_nudge_config(params.extra_args)
-        lt_id = lt_slash_id = bang_id = None
+        lt_id = lt_slash_id = bang_id = newline_id = None
         if nudge is not None:
-            lt_id, lt_slash_id, bang_id = nudge
+            lt_id, lt_slash_id, bang_id, newline_id = nudge
         return (
             im_end_id,
             output_tok_ids,
@@ -405,6 +407,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             lt_id,
             lt_slash_id,
             bang_id,
+            newline_id,
         )
 
     def _step_bans_and_deltas(
@@ -433,6 +436,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             lt_id,
             lt_slash_id,
             bang_id,
+            newline_id,
         ) = state
         banned = step_banned_ids(
             prefix,
@@ -447,6 +451,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             trailing_backtick_ids=trailing_backtick_ids,
             close_paren_id=close_paren_id,
             open_paren_id=open_paren_id,
+            bang_id=bang_id,
+            newline_id=newline_id,
         )
         deltas = step_citation_logit_deltas(
             prefix,
@@ -459,6 +465,10 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             lt_id=lt_id,
             lt_slash_id=lt_slash_id,
             bang_id=bang_id,
+            newline_id=newline_id,
+            im_end_id=im_end_id,
+            tool_start_id=tool_start,
+            tool_end_id=tool_end,
         )
         return banned, deltas
 
