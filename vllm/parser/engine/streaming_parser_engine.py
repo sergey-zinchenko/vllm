@@ -648,7 +648,9 @@ class StreamingParserEngine:
         except after a newline-broken dangling backtick, where Uppercase
         Latin is usually more CoT (`` `\n</think>\n\nThe user…` ``).
         After that broken inline, punctuation like ``"`` commits instead
-        (production: ``generating `\n</think>\n\n"`` aborted the end).
+        (production: ``generating `\n</think>\n\n"`` aborted the end),
+        but a bare closing `` ` `` still continues — that is the close of
+        a `` `\n</think>` `` citation (production chatcmpl-afe130).
         """
         if not text.strip():
             return True
@@ -664,6 +666,9 @@ class StreamingParserEngine:
             return False
         # Leading '<' is still think prose (e.g. <|endoftext|>).
         if first == "<":
+            return True
+        # Closing backtick of a broken-inline `` `\n</think>` `` citation.
+        if after_broken_inline and first == "`":
             return True
         # Closing or sentence punctuation: bare citation mid-sentence.
         # Skip after broken inline — ``"`` / ``)`` there usually starts
@@ -710,6 +715,14 @@ class StreamingParserEngine:
             self.state = ParserState.REASONING
             raw = f"{marker}{buffered}{text}"
             value = self._escape_and_feed(raw)
+            # `` `\n</think>` ``: newline already closed the open span, so
+            # the "closing" backtick re-opens inline in markdown state.
+            # Clear it — otherwise the next real </think> is inert code.
+            body = text.lstrip(" \t\r")
+            check = body.lstrip("\n") if body.startswith("\n") else text.lstrip()
+            if after_broken and check.startswith("`"):
+                self._md_inline_odd = False
+                self._md_inline_closed_by_newline = False
             self._note_reasoning_content(value)
             return [
                 SemanticEvent(

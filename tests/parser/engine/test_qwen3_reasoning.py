@@ -1160,6 +1160,39 @@ class TestMarkdownInertStructuralTags:
         assert "＜/think＞" not in reasoning
         assert "&lt;/think&gt;" not in reasoning
 
+    def test_newline_broken_think_end_closing_backtick_stays_reasoning(self, parser):
+        """`` `\n</think>` `` citation must not end reasoning (afe130…).
+
+        Production: dangling backtick + newline deferred ``</think>``, then
+        the closing `` ` `` committed the end (punctuation no longer
+        continued after broken-inline). CoT after the citation leaked into
+        content and broke the reasoning UI accordion.
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "fails to close the `",
+                "\n",
+                "</think>",
+                "` tag properly. Still planning.",
+                "</think>",
+                "\n\nAnswer.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+                (_THINK_END_ID,),
+                (4,),
+            ],
+        )
+        assert "tag properly" in reasoning
+        assert "Still planning." in reasoning
+        assert "tag properly" not in content
+        assert "Still planning." not in content
+        assert content.lstrip() == "Answer."
+
 
 class TestMidReasoningCitations:
     """Cited think tags mid-reasoning must never leave holes.
