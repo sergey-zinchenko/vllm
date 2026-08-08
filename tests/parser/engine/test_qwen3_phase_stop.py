@@ -159,9 +159,12 @@ class TestMergedBacktickStopGuard:
         )
 
     def test_merged_backtick_ban_is_non_sticky_after_two(self):
-        # Control: two tokens after the merged backtick re-allows im_end.
+        # Control: two tokens after the merged backtick re-allows im_end;
+        # post-latch still bans think_end.
         cfg = self._cfg()
-        assert banned_ids_for_request([_THINK_END, _SPACE_BACKTICK, 2, 3], cfg) == []
+        assert banned_ids_for_request(
+            [_THINK_END, _SPACE_BACKTICK, 2, 3], cfg
+        ) == [_THINK_END]
 
     def test_stop_ignore_stays_reasoning_only(self):
         # Control: a sampled im_end after a merged backtick is never ignored.
@@ -290,7 +293,10 @@ class TestThinkCitationAfterClose:
         )
 
     def test_think_start_after_close_does_not_ban_im_end(self):
-        assert banned_ids_for_request(self._CITED_THINK, self._CFG) == []
+        # im_end free; think_end stays banned after the one-way latch.
+        assert banned_ids_for_request(self._CITED_THINK, self._CFG) == [
+            _THINK_END
+        ]
 
     def test_think_start_after_close_does_not_ignore_stop(self):
         assert not should_ignore_stop_token(_IM_END, self._CITED_THINK, self._CFG)
@@ -299,9 +305,19 @@ class TestThinkCitationAfterClose:
         # Control: genuine unclosed think keeps the ban (unchanged).
         assert banned_ids_for_request([_THINK_START, 1], self._CFG) == [_IM_END]
 
-    def test_closed_think_still_allows(self):
-        # Control: closed think allows im_end (unchanged).
-        assert banned_ids_for_request([_THINK_START, 1, _THINK_END, 2], self._CFG) == []
+    def test_closed_think_still_allows_im_end(self):
+        # Closed think allows im_end; latch still bans further think_end.
+        assert banned_ids_for_request(
+            [_THINK_START, 1, _THINK_END, 2], self._CFG
+        ) == [_THINK_END]
+
+    def test_closed_think_bans_further_think_end(self):
+        """Regression chatcmpl-8b9c: no second special </think> mid-answer."""
+        banned = set(
+            banned_ids_for_request([_THINK_END, 1, 2], self._CFG)
+        )
+        assert banned == {_THINK_END}
+        assert _IM_END not in banned
 
 
 class TestDanglingBacktick:
@@ -497,7 +513,7 @@ class TestRequestWiring:
             ]
         }
         assert banned_ids_for_request([1, 2], extra) == [_IM_END]
-        assert banned_ids_for_request([_THINK_END, 3], extra) == []
+        assert banned_ids_for_request([_THINK_END, 3], extra) == [_THINK_END]
 
     def test_banned_ids_for_request_dangling_backtick(self):
         extra = {
@@ -518,8 +534,57 @@ class TestRequestWiring:
         assert {_IM_END, _THINK_END} <= set(
             banned_ids_for_request([_THINK_END, _BACKTICK, 1], extra)
         )
-        # Non-sticky: two tokens after the backtick re-allows both.
-        assert banned_ids_for_request([_THINK_END, _BACKTICK, 1, 2], extra) == []
+        # Non-sticky for im_end; latch keeps think_end banned.
+        assert banned_ids_for_request(
+            [_THINK_END, _BACKTICK, 1, 2], extra
+        ) == [_THINK_END]
+
+    def test_spec_draft_prefix_bans_think_end_after_backtick_newline(self):
+        """MTP hole: draft ``[space_backtick, newline, think_end]`` mid-answer.
+
+        After the first think_end latch, row k=2 must see accepted+draft[:2]
+        (dangling) and ban TE — same shape as chatcmpl-8b9c Treat/`/TE.
+        """
+        from vllm.parser.qwen3_phase_stop import step_banned_ids
+
+        newline = 198
+        treat = 18307
+        # Prior accepted output already closed think once.
+        accepted = [_THINK_END, treat]
+        draft = [_SPACE_BACKTICK, newline, _THINK_END]
+        # Row for think_end (index 2): prefix ends with backtick, newline.
+        banned = set(
+            step_banned_ids(
+                accepted + draft[:2],
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+            )
+        )
+        assert _THINK_END in banned
+        assert _IM_END in banned
+        # Row 0 (before draft backtick): latch alone bans TE; im_end free.
+        banned0 = set(
+            step_banned_ids(
+                accepted,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+            )
+        )
+        assert banned0 == {_THINK_END}
 
     def test_should_ignore_stop_token_reasoning_only(self):
         """A sampled im_end is ignored only mid-think, never for backticks.

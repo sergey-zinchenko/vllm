@@ -104,8 +104,9 @@ def qwen3_config(
     Args:
         thinking: Start in REASONING when True, else CONTENT.
         tool_call_ends_reasoning: Legacy behavior — bare ``<tool_call>``
-            ends think and starts a tool (Nemotron V3). Hardened Qwen3
-            keeps this False so markup inside think is plain text.
+            immediately emits ``REASONING_END`` (Nemotron V3). Hardened
+            Qwen3 keeps this False: ``TOOL_START`` enters ``TOOL_PREAMBLE``
+            and ``REASONING_END`` waits for confirmed ``<function=``.
         orphan_func_prefix: Bare ``<function=`` in CONTENT starts a tool.
             Prose citations without ``<parameter=`` are rejected back to
             text when ``validate_tool_names`` is on.
@@ -218,11 +219,18 @@ def qwen3_config(
         ),
     }
     if tool_call_ends_reasoning:
-        # Legacy: <tool_call> from REASONING implicitly ends think.
+        # Legacy: <tool_call> from REASONING immediately ends think.
         # TOOL_CALL_START still waits for <function= (same as content).
         transitions[(ParserState.REASONING, "TOOL_START")] = Transition(
             ParserState.TOOL_PREAMBLE,
             (EventType.REASONING_END,),
+        )
+    else:
+        # Hardened: hold in preamble; streaming engine emits REASONING_END
+        # only when <function= confirms a real invoke (citations abort).
+        transitions[(ParserState.REASONING, "TOOL_START")] = Transition(
+            ParserState.TOOL_PREAMBLE,
+            (),
         )
     if orphan_func_prefix:
         transitions[(ParserState.CONTENT, "FUNC_PREFIX")] = Transition(
@@ -273,11 +281,11 @@ class Qwen3Parser(ParserEngine):
     ``<tool_call>`` XML tool calls in a single engine.
 
     Hardened invariants:
-    - Tool markup inside reasoning is plain text (never ends think,
-      never emits ``tool_calls``).
-    - Reasoning ends only on confirmed ``</think>`` (never on unpaired
-      ``<tool_call>``). Mid-sentence ``</think>`` / ``<tool_call>``
-      mentions stay full reasoning text (no holes, no tool emit).
+    - Confirmed ``<tool_call>`` + ``<function=`` from REASONING ends think
+      via ``TOOL_PREAMBLE`` (not immediate legacy end on bare tag).
+    - Bare / cited tool tags stay reasoning text (preamble abort / markdown).
+    - Reasoning ends on confirmed ``</think>`` or confirmed tool; mid-sentence
+      ``</think>`` / ``<tool_call>`` mentions stay full reasoning text.
     - Bare ``<tool_call>`` in content is not a tool until
       ``<function=`` follows; otherwise it streams as text (citations).
     - Structural tags inside markdown `` `...` `` / fenced code are inert
@@ -325,10 +333,14 @@ class Qwen3Parser(ParserEngine):
             tools,
             **kwargs,
         )
-        self._tool_call_ends_reasoning = (
-            ParserState.REASONING,
-            "TOOL_START",
-        ) in self.parser_engine_config.transitions
+        # Legacy = REASONING_END on TOOL_START; hardened = preamble hold only.
+        _tool_from_reason = self.parser_engine_config.transitions.get(
+            (ParserState.REASONING, "TOOL_START")
+        )
+        self._tool_call_ends_reasoning = bool(
+            _tool_from_reason is not None
+            and EventType.REASONING_END in _tool_from_reason.events
+        )
         vocab = self.vocab
         self._tool_call_token_id: int | None = vocab.get(self.TOOL_START)
         self._tool_call_end_token_id: int | None = vocab.get(self.TOOL_END)

@@ -346,9 +346,16 @@ class RejectionSampler(nn.Module):
                     Qwen3PhaseStopLogitsProcessor,
                 ),
             ):
-                logits = processor.apply_with_spec_decode(
-                    logits, metadata.num_draft_tokens
-                )
+                if isinstance(processor, Qwen3PhaseStopLogitsProcessor):
+                    logits = processor.apply_with_spec_decode(
+                        logits,
+                        metadata.num_draft_tokens,
+                        spec_token_ids=sampling_metadata.spec_token_ids,
+                    )
+                else:
+                    logits = processor.apply_with_spec_decode(
+                        logits, metadata.num_draft_tokens
+                    )
         holder = sampling_metadata.thinking_budget_state_holder
         if holder is not None and holder.has_tracked_requests():
             logits = holder.apply_to_logits(

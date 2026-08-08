@@ -357,6 +357,8 @@ def step_banned_ids(
 
     Rules compose:
     - reasoning phase: ``im_end`` banned while inside the think block;
+    - after think latch (not in reasoning): ``think_end`` banned forever
+      so mid-answer citations / MTP cannot sample another special close;
     - dangling backtick: ``im_end`` **and** ``think_end`` banned for
       a two-token window after an opening `` ` `` (covers `` `\n</think>``);
     - empty start (no output yet, initial reasoning): ``think_end`` and
@@ -391,6 +393,17 @@ def step_banned_ids(
     if im_end_id is not None and (in_reasoning or dangling):
         banned.append(im_end_id)
     if dangling and think_end_id is not None and think_end_id not in banned:
+        banned.append(think_end_id)
+    # One-way latch: after the first think close appears in output, never
+    # sample think_end again (chatcmpl-8b9c: ``Treat `\n</think>`` mid-answer).
+    # Require a seen think_end so content-only turns (initial_reasoning=False)
+    # are not locked out of an optional first close.
+    if (
+        not in_reasoning
+        and think_end_id is not None
+        and think_end_id not in banned
+        and any(tid == think_end_id for tid in output_token_ids)
+    ):
         banned.append(think_end_id)
     if not output_token_ids and initial_reasoning:
         if think_end_id is not None and think_end_id not in banned:

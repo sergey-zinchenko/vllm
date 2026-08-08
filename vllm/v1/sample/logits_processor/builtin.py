@@ -470,33 +470,76 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         self,
         logits: torch.Tensor,
         num_draft_tokens: list[int],
+        spec_token_ids: list[list[int]] | None = None,
     ) -> torch.Tensor:
-        """Ban the active id set on all draft rows while in ban phase."""
-        active = self._active_ban_reqs()
-        if not active:
+        """Ban phase ids per draft row using accepted + prior draft tokens.
+
+        Without *spec_token_ids*, the accepted-output ban set is applied to
+        every draft row (legacy). With drafts, row ``k`` uses
+        ``accepted + draft[:k]`` so `` `\n</think>`` cannot sneak through
+        MTP as a single multi-token accept (production chatcmpl-8b9c).
+        """
+        from vllm.parser.qwen3_phase_stop import step_banned_ids
+
+        if not self.reqs:
             return logits
 
         num_draft_arr = np.array(num_draft_tokens, dtype=np.int64)
         cumsum = np.concatenate([[0], np.cumsum(num_draft_arr)])
-        all_rows: list[np.ndarray] = []
-        all_toks: list[np.ndarray] = []
+        row_list: list[int] = []
+        tok_list: list[int] = []
 
-        for req_idx, banned_ids in active:
+        for req_idx, (
+            im_end_id,
+            out_tok_ids,
+            think_start,
+            think_end,
+            tool_start,
+            tool_end,
+            initial,
+            backtick_id,
+            fence_id,
+            close_paren_id,
+            open_paren_id,
+            trailing_backtick_ids,
+        ) in self.reqs.items():
             n = int(num_draft_arr[req_idx])
             if n <= 0:
                 continue
-            offset = cumsum[req_idx]
-            rows = np.arange(offset, offset + n, dtype=np.int64)
-            for tid in banned_ids:
-                all_rows.append(rows)
-                all_toks.append(np.full(n, tid, dtype=np.int64))
+            offset = int(cumsum[req_idx])
+            draft = (
+                spec_token_ids[req_idx]
+                if spec_token_ids is not None and req_idx < len(spec_token_ids)
+                else None
+            )
+            accepted = list(out_tok_ids)
+            for k in range(n):
+                if draft is not None:
+                    prefix: Sequence[int] = accepted + draft[:k]
+                else:
+                    prefix = accepted
+                banned = step_banned_ids(
+                    prefix,
+                    im_end_id=im_end_id,
+                    think_start_id=think_start,
+                    think_end_id=think_end,
+                    tool_start_id=tool_start,
+                    tool_end_id=tool_end,
+                    initial_reasoning=initial,
+                    backtick_id=backtick_id,
+                    fence_id=fence_id,
+                    trailing_backtick_ids=trailing_backtick_ids,
+                    close_paren_id=close_paren_id,
+                    open_paren_id=open_paren_id,
+                )
+                for tid in banned:
+                    row_list.append(offset + k)
+                    tok_list.append(tid)
 
-        if all_rows:
-            rows_arr = np.concatenate(all_rows)
-            toks_arr = np.concatenate(all_toks)
+        if row_list:
             logits_slice = (
-                async_tensor_h2d(rows_arr, device=self.device),
-                async_tensor_h2d(toks_arr, device=self.device),
+                async_tensor_h2d(row_list, device=self.device),
+                async_tensor_h2d(tok_list, device=self.device),
             )
             logits.index_put_(logits_slice, self.neg_inf_tensor)
         return logits

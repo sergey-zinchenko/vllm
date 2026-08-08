@@ -4,8 +4,9 @@
 
 Validates that ``Qwen3Parser`` correctly handles
 ``<think>``/``</think>`` reasoning with Qwen3 hardened invariants:
-- Tool markup inside think stays reasoning text (never implicit end)
-- Reasoning ends only on confirmed ``</think>`` (not mid-sentence mentions)
+- Confirmed ``<tool_call>``+``<function=`` from REASONING ends think (preamble)
+- Bare / cited tool tags stay reasoning text (preamble abort / markdown)
+- Reasoning ends only on confirmed ``</think>`` or confirmed tool (not mid-sentence)
 - Stripping ``<think>`` from generated output (old template compat)
 - No confirmed ``</think>`` terminal text leaks into output
 """
@@ -121,34 +122,49 @@ class TestNonStreaming:
         assert "Step 3" in reasoning
         assert content == "Result: 7."
 
-    def test_tool_call_inside_think_stays_reasoning(self, parser):
-        """Tool markup inside <think> stays plain reasoning text."""
+    def test_confirmed_tool_from_think_ends_reasoning(
+        self, mock_tokenizer, mock_request
+    ):
+        """Confirmed tool from REASONING ends think (preamble salvage)."""
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "bash",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        mock_request.tools = tools
+        parser = Qwen3Parser(mock_tokenizer, tools=tools)
         text = (
             "<think>I need to read the file.\n\n"
             "<tool_call>\n<function=bash>\n"
             "<parameter=cmd>ls</parameter>\n"
             "</function>\n</tool_call>"
         )
-        reasoning, content = parser.extract_reasoning(text, None)
-        assert reasoning is not None
-        _assert_tag_visible(reasoning, "<tool_call>")
-        _assert_tag_visible(reasoning, "<function=")
-        assert "bash" in reasoning
-        assert content is None
+        reasoning, content, tool_calls = parser.parse(text, mock_request)
+        assert reasoning == "I need to read the file."
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "bash"
         assert not parser.is_reasoning_end([_THINK_START_ID, 1, _TOOL_CALL_ID])
 
-    def test_tool_call_without_think_end_stays_reasoning(self, parser):
-        """Without </think>, tool markup remains reasoning (truncated)."""
-        text = (
-            "I need to read the file.\n\n"
-            "<tool_call>\n<function=bash>\n"
-            "<parameter=cmd>ls</parameter>\n"
-            "</function>\n</tool_call>"
-        )
+    def test_bare_tool_call_without_function_stays_reasoning(self, parser):
+        """Bare <tool_call> without <function= aborts preamble to reasoning."""
+        text = "I need to read the file.\n\n<tool_call>\nand then more prose."
         reasoning, content = parser.extract_reasoning(text, None)
         assert reasoning is not None
         _assert_tag_visible(reasoning, "<tool_call>")
-        assert content is None
+        assert "more prose" in reasoning
+        assert content is None or content == ""
 
     def test_live_scenario_think_end_before_tool_call(self, parser):
         """Real model output: </think> immediately before <tool_call>.
@@ -294,11 +310,11 @@ class TestStreaming:
         assert reasoning == "reasoning"
         assert content == "Content"
 
-    def test_streaming_tool_call_stays_in_reasoning(self, parser):
-        """<tool_call> inside think streams as reasoning, not content."""
+    def test_streaming_bare_tool_call_citation_stays_in_reasoning(self, parser):
+        """Bare <tool_call> without <function= stays reasoning prose."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
-            ["I need to check.", "<tool_call>", "\n<function=test>"],
+            ["I need to check.", "<tool_call>", " as a citation."],
             [
                 (1,),
                 (_TOOL_CALL_ID,),
@@ -307,6 +323,7 @@ class TestStreaming:
         )
         assert "I need to check." in reasoning
         _assert_tag_visible(reasoning, "<tool_call>")
+        assert "as a citation" in reasoning
         assert content == ""
 
     def test_mentioned_think_end_stays_reasoning(self, parser):
@@ -600,10 +617,10 @@ class TestTrailingWhitespaceStripping:
     def test_streaming_trailing_newlines_before_tool_call_in_think(
         self, parser_with_strip
     ):
-        """Tool markup in think stays reasoning; strip only applies at </think>."""
+        """Bare tool citation in think stays reasoning; strip waits for </think>."""
         reasoning, content = simulate_reasoning_streaming(
             parser_with_strip,
-            ["I'll check.\n\n", "<tool_call>", "<function=test>"],
+            ["I'll check.\n\n", "<tool_call>", " as a citation."],
             [
                 (1,),
                 (_TOOL_CALL_ID,),
@@ -612,6 +629,7 @@ class TestTrailingWhitespaceStripping:
         )
         assert "I'll check." in reasoning
         _assert_tag_visible(reasoning, "<tool_call>")
+        assert "as a citation" in reasoning
         assert content == ""
 
     def test_whitespace_only_think_then_tool_is_none_reasoning(
@@ -757,6 +775,25 @@ class TestStructuralTagProseInvariants:
         assert tool_calls is not None
         assert len(tool_calls) == 1
         assert tool_calls[0].name == "get_weather"
+
+    def test_confirmed_tool_without_think_end_emits_tool(
+        self, parser_with_tools, mock_request
+    ):
+        """Production chatcmpl-9548d: tool XML without </think> must emit."""
+        text = (
+            "Let's search.\n\n"
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        reasoning, content, tool_calls = parser_with_tools.parse(text, mock_request)
+        assert reasoning == "Let's search."
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "get_weather"
+        assert content is None or content == ""
 
     def test_think_end_and_tool_in_same_delta_still_emits(
         self, mock_tokenizer, mock_request

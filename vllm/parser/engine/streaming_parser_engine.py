@@ -601,7 +601,13 @@ class StreamingParserEngine:
         self._tool_preamble_buffer = ""
 
         if self._reasoning_end_before_tool or self._think_end_marker:
-            marker = self._terminal_text("THINK_END", self._think_end_marker)
+            # From THINK_END_PENDING: keep deferred </think> in the abort
+            # text. From REASONING (hardened hold): flush tool tags only.
+            marker = (
+                self._terminal_text("THINK_END", self._think_end_marker)
+                if self._think_end_marker
+                else ""
+            )
             think_ws = self._think_end_pending_buffer
             self._clear_think_end_pending_flags()
             self._reasoning_end_before_tool = False
@@ -849,6 +855,13 @@ class StreamingParserEngine:
             if previous_state == ParserState.THINK_END_PENDING:
                 # Keep </think> marker; confirm REASONING_END only on
                 # <function= (real tool after think).
+                self._reasoning_end_before_tool = True
+            elif (
+                previous_state == ParserState.REASONING
+                and EventType.REASONING_END not in transition.events
+            ):
+                # Hardened: tool from open think — defer REASONING_END
+                # until <function= confirms (not legacy immediate end).
                 self._reasoning_end_before_tool = True
 
         # Enter deferred </think> hold.
