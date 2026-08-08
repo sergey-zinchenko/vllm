@@ -1154,6 +1154,54 @@ class TestMarkdownInertStructuralTags:
         assert "The user wants me to look" not in content
         assert content.lstrip() == "Final answer."
 
+    def test_newline_broken_think_end_based_on_commits_answer(self, parser):
+        """`` `\n</think>\n\nBased on…` `` must commit (chatcmpl-8af237…).
+
+        Production: empty citation + early ``</think>``, then answer-like
+        Uppercase ``Based on…`` was treated as CoT continuation → escaped
+        ``</think>`` stayed in reasoning and the answer never left think.
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                'generating". This caused ',
+                "`\n",
+                "</think>",
+                "\n\nBased on the search results.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID,),
+                (3,),
+            ],
+        )
+        assert "caused" in reasoning
+        assert "Based on the search results." in content
+        assert "Based on the search results." not in reasoning
+        assert "</think>" not in reasoning
+        assert "&lt;/think&gt;" not in reasoning
+        assert "＜/think＞" not in reasoning
+
+    def test_newline_broken_think_end_based_on_same_delta(self, parser):
+        """Same-delta ``</think>\\n\\nBased`` (prod ``[248069, 271, …]``)."""
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                'generating". This caused ',
+                "`\n",
+                "</think>\n\nBased on the search results.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID, 3),
+            ],
+        )
+        assert "Based on the search results." in content
+        assert "Based on the search results." not in reasoning
+        assert "&lt;/think&gt;" not in reasoning
+
     def test_newline_broken_think_end_then_tool_still_emits(
         self, parser_with_tools, mock_request
     ):

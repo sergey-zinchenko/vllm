@@ -645,12 +645,14 @@ class StreamingParserEngine:
         (when not after a broken dangling backtick) closing/sentence
         punctuation. Everything else (Uppercase, CJK, digits, markdown
         markup like ``#``/``-``/``*``/``>``, emoji) commits the end —
-        except after a newline-broken dangling backtick, where Uppercase
-        Latin is usually more CoT (`` `\n</think>\n\nThe user…` ``).
-        After that broken inline, punctuation like ``"`` commits instead
-        (production: ``generating `\n</think>\n\n"`` aborted the end),
-        but a bare closing `` ` `` still continues — that is the close of
-        a `` `\n</think>` `` citation (production chatcmpl-afe130).
+        except after a newline-broken dangling backtick, where a small
+        set of CoT openers (``The user…`` / ``Wait…``) still continues.
+        Other Uppercase there is a real answer (production chatcmpl-8af237:
+        `` `\n</think>\n\nBased on…``). After that broken inline,
+        punctuation like ``"`` commits instead (production:
+        ``generating `\n</think>\n\n"`` aborted the end), but a bare
+        closing `` ` `` still continues — that is the close of a
+        `` `\n</think>` `` citation (production chatcmpl-afe130).
         """
         if not text.strip():
             return True
@@ -678,9 +680,9 @@ class StreamingParserEngine:
         # Cased-lowercase continues the reasoning sentence.
         if first.islower():
             return True
-        # After newline-broken `` ` ``, Uppercase Latin is usually more
-        # CoT (`` `\n</think>\n\nThe user…` ``), not a real answer.
-        return after_broken_inline and first.isascii() and first.isupper()
+        # After newline-broken `` ` ``, only known CoT openers continue;
+        # other Uppercase (``Based on…``) commits the end.
+        return after_broken_inline and check.startswith(("The user", "Wait"))
 
     def _clear_think_end_pending_flags(self) -> None:
         self._think_end_marker = ""
