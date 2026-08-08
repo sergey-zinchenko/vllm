@@ -1102,6 +1102,64 @@ class TestMarkdownInertStructuralTags:
         assert collect_function_name(results) == "get_weather"
         assert "<function=" not in collect_content(results)
 
+    def test_newline_broken_think_end_then_quote_commits_answer(self, parser):
+        """`` `\n</think>\n\n" `` must commit the end (chatcmpl-8b7155…).
+
+        Production: dangling backtick + newline deferred ``</think>``, then
+        ``"`` was treated as continuation punctuation → abort back into
+        reasoning and empty content.
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "This is often related to the model generating `",
+                "\n",
+                '</think>\n\n"',
+                "Answer follows.",
+            ],
+            [
+                (1,),
+                (2,),
+                (_THINK_END_ID, 3, 4),
+                (5,),
+            ],
+        )
+        assert "generating" in reasoning
+        assert "Answer follows." in content
+        assert "Answer follows." not in reasoning
+        assert "</think>" not in reasoning
+        assert "&lt;/think&gt;" not in reasoning
+
+    def test_unclosed_fence_think_end_still_exits_to_content(self, parser):
+        """Unclosed ``` must not make ``</think>`` inert (chatcmpl-86dedb…).
+
+        Production: model opened a fence while still thinking, never closed
+        it, then emitted special ``</think>`` — tag was fullwidth-neutralized
+        as code prose and the Russian answer stayed in reasoning (0 content).
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "Let us write the response.\n\n",
+                "```",
+                "markdown\n",
+                "</think>\n\n",
+                "Я покопался в исходниках vLLM.",
+            ],
+            [
+                (1,),
+                (2,),
+                (3,),
+                (_THINK_END_ID,),
+                (4,),
+            ],
+        )
+        assert "Let us write the response." in reasoning
+        assert "Я покопался" in content
+        assert "Я покопался" not in reasoning
+        assert "＜/think＞" not in reasoning
+        assert "&lt;/think&gt;" not in reasoning
+
 
 class TestMidReasoningCitations:
     """Cited think tags mid-reasoning must never leave holes.

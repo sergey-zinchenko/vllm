@@ -320,11 +320,13 @@ class StreamingParserEngine:
                     )
                 )
             self._clear_think_end_pending_flags()
+            self._clear_markdown_code_state()
             self.state = ParserState.CONTENT
         elif self.state == ParserState.REASONING:
             events.append(
                 SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index)
             )
+            self._clear_markdown_code_state()
             self.state = ParserState.CONTENT
         elif self.state == ParserState.MESSAGE_HEADER:
             if self._message_header_buffer:
@@ -499,8 +501,16 @@ class StreamingParserEngine:
         if self._has_drops and terminal == DROP_TERMINAL and transition is None:
             return []
 
-        # Inside markdown code: all structural tags are inert prose.
-        if self._in_markdown_code() and self._is_structural_terminal(terminal):
+        # Inside markdown code: structural tags are inert prose — except
+        # THINK_END in an open fence. An unclosed ``` would otherwise
+        # swallow every later </think> special (production chatcmpl-86dedb:
+        # answer stuck in reasoning with fullwidth ＜/think＞). Inline
+        # `` `...` `` citations stay inert.
+        if (
+            self._in_markdown_code()
+            and self._is_structural_terminal(terminal)
+            and not (terminal == "THINK_END" and self._md_in_fence)
+        ):
             return self._emit_for_state(text)
 
         # Mid-reasoning cited ``<think>``: the no-event self-loop strips the
@@ -632,11 +642,13 @@ class StreamingParserEngine:
         reasoning block (catastrophic); falsely closing on a citation
         only misroutes a tail. So continuation requires explicit
         evidence — cased-lowercase prose, a ``<|…|>``-style mention, or
-        closing/sentence punctuation. Everything else (Uppercase, CJK,
-        digits, markdown markup like ``#``/``-``/``*``/``>``, emoji)
-        commits the end — except after a newline-broken dangling
-        backtick, where Uppercase Latin is usually more CoT
-        (`` `\n</think>\n\nThe user…` ``) rather than a real answer.
+        (when not after a broken dangling backtick) closing/sentence
+        punctuation. Everything else (Uppercase, CJK, digits, markdown
+        markup like ``#``/``-``/``*``/``>``, emoji) commits the end —
+        except after a newline-broken dangling backtick, where Uppercase
+        Latin is usually more CoT (`` `\n</think>\n\nThe user…` ``).
+        After that broken inline, punctuation like ``"`` commits instead
+        (production: ``generating `\n</think>\n\n"`` aborted the end).
         """
         if not text.strip():
             return True
@@ -654,7 +666,9 @@ class StreamingParserEngine:
         if first == "<":
             return True
         # Closing or sentence punctuation: bare citation mid-sentence.
-        if first in ",;:)]}'\"`.?!":
+        # Skip after broken inline — ``"`` / ``)`` there usually starts
+        # the answer (or a dead-end abort), not a mid-citation close.
+        if not after_broken_inline and first in ",;:)]}'\"`.?!":
             return True
         # Cased-lowercase continues the reasoning sentence.
         if first.islower():
@@ -667,6 +681,16 @@ class StreamingParserEngine:
         self._think_end_marker = ""
         self._think_end_pending_buffer = ""
         self._think_end_pending_after_broken_inline = False
+        self._md_inline_closed_by_newline = False
+
+    def _clear_markdown_code_state(self) -> None:
+        """Drop fence/inline code state when leaving reasoning.
+
+        An unclosed ``` opened during think must not keep neutralizing
+        answer-phase tags or leave the stream "inside" a code block.
+        """
+        self._md_in_fence = False
+        self._md_inline_odd = False
         self._md_inline_closed_by_newline = False
 
     def _resolve_think_end_pending(self, text: str) -> list[SemanticEvent]:
@@ -695,6 +719,7 @@ class StreamingParserEngine:
                 )
             ]
 
+        self._clear_markdown_code_state()
         self.state = ParserState.CONTENT
         events = [
             SemanticEvent(EventType.REASONING_END, tool_index=self.tool_index),
@@ -858,6 +883,7 @@ class StreamingParserEngine:
                 )
                 self._reasoning_end_before_tool = False
                 self._clear_think_end_pending_flags()
+                self._clear_markdown_code_state()
             self._tool_preamble_open = ""
             self._tool_preamble_buffer = ""
         elif (
@@ -873,6 +899,7 @@ class StreamingParserEngine:
             and EventType.REASONING_END in transition.events
         ):
             self._clear_think_end_pending_flags()
+            self._clear_markdown_code_state()
             self._reasoning_end_before_tool = False
 
         if (
