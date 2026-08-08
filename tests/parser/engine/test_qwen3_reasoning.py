@@ -1063,6 +1063,42 @@ class TestMarkdownInertStructuralTags:
         assert "closes think." in reasoning
         _assert_tag_visible(reasoning, "</think>")
 
+    def test_streaming_text_backticked_tool_call_no_tool_events(
+        self, parser_with_tools, mock_request
+    ):
+        """Text `` `<tool_call>` `` in reasoning must not emit tool_calls.
+
+        Citation text-path after dangling backtick: markdown-inert keeps
+        the tag as fullwidth prose (no TOOL_PREAMBLE / no events).
+        """
+        from tests.parser.engine.streaming_helpers import (
+            collect_content,
+            collect_function_name,
+            simulate_tool_streaming,
+        )
+
+        chunks = [
+            "PR title: Treat `",
+            "<tool_call>",
+            "` as implicit end. Still planning.",
+            "</think>\n\n",
+            "Answer.",
+        ]
+        results = simulate_tool_streaming(
+            parser_with_tools, mock_request, chunks
+        )
+        assert collect_function_name(results) is None
+        content = collect_content(results)
+        assert "Answer." in content
+        # Reasoning deltas should show the citation, not a tool invoke.
+        reasoning_parts = []
+        for delta, _ in results:
+            if delta and delta.reasoning:
+                reasoning_parts.append(delta.reasoning)
+        reasoning = "".join(reasoning_parts)
+        assert "Still planning." in reasoning
+        _assert_tag_visible(reasoning, "<tool_call>")
+
     def test_backticked_tool_call_pr_title_stays_reasoning(self, parser):
         text = "PR #35687: Treat `<tool_call>` as implicit reasoning end."
         reasoning, content = parser.extract_reasoning(text, None)
@@ -2007,10 +2043,10 @@ class TestBacktickCitationHoldback:
     """Dangling-backtick citations must survive detokenizer holdback.
 
     Production: token ids arrive before decoded text. A backtick id with
-    empty delta_text leaves markdown state unset; a following ``</think>``
-    special id would close think for real. The sampler bans ``think_end``
-    for that one step; the parser still keeps `` `<tool_call>` `` citations
-    intact when text and ids are (eventually) aligned.
+    empty delta_text leaves markdown state unset; a following special tag
+    id would fire for real. The sampler bans all structural specials for
+    that window; citations use text/BPE. The parser still keeps
+    `` `<tool_call>` `` intact when text and ids are (eventually) aligned.
     """
 
     def test_sampler_bans_think_end_after_backtick_id(self):
@@ -2020,14 +2056,15 @@ class TestBacktickCitationHoldback:
         )
 
         # Holdback-shaped history: only ids matter for the ban.
-        backtick, space_bt, im_end, think_end, tool_start = 40, 42, 30, 51, 60
+        backtick, space_bt, im_end, think_start, think_end = 40, 42, 30, 50, 51
+        tool_start, tool_end = 60, 61
         extra = {
             PHASE_BAN_XARG_KEY: [
                 im_end,
-                50,
+                think_start,
                 think_end,
                 tool_start,
-                61,
+                tool_end,
                 1,
                 backtick,
                 41,
@@ -2035,10 +2072,9 @@ class TestBacktickCitationHoldback:
             ]
         }
         banned = set(banned_ids_for_request([1, space_bt], extra))
-        assert {im_end, think_end} <= banned
-        assert tool_start not in banned
+        assert {im_end, think_start, think_end, tool_start, tool_end} <= banned
         banned_lone = set(banned_ids_for_request([1, backtick], extra))
-        assert {im_end, think_end} <= banned_lone
+        assert {im_end, think_end, tool_start} <= banned_lone
 
     def test_treat_tool_call_citation_keeps_tail(self, mock_tokenizer):
         # Aligned text+ids: the screenshot sentence must not lose its tail.

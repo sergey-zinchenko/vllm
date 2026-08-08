@@ -318,38 +318,44 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
     to ``-inf``. After think closes, odd single-backtick token parity also
     bans ``im_end`` (unclosed inline code span). Open tool markup does not
     ban stop (prose citations of ``<tool_call>`` must remain stoppable).
-    Works with speculative decoding via :meth:`apply_with_spec_decode`
-    (same pattern as min-tokens).
+    After a dangling `` ` ``, all structural specials are banned and
+    text-tag openers (``<`` / ``</``) get a soft boost. Works with
+    speculative decoding via :meth:`apply_with_spec_decode`.
     """
+
+    # (im_end, out_ids, think_start, think_end, tool_start, tool_end,
+    #  initial, backtick, fence, close_paren, open_paren, trailing,
+    #  lt_id, lt_slash_id, bang_id)
+    _ReqState = tuple[
+        int,
+        Sequence[int],
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+        bool,
+        int | None,
+        int | None,
+        int | None,
+        int | None,
+        frozenset[int],
+        int | None,
+        int | None,
+        int | None,
+    ]
 
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
     ):
-        from vllm.parser.qwen3_phase_stop import parse_phase_ban_config
+        from vllm.parser.qwen3_phase_stop import (
+            parse_citation_nudge_config,
+            parse_phase_ban_config,
+        )
 
         self._parse_phase_ban_config = parse_phase_ban_config
+        self._parse_citation_nudge_config = parse_citation_nudge_config
         self.device = device
-        # index -> (im_end_id, output_tok_ids, think_start, think_end,
-        #           tool_start, tool_end, initial_reasoning, backtick_id,
-        #           fence_id, close_paren_id, open_paren_id,
-        #           trailing_backtick_ids)
-        self.reqs: dict[
-            int,
-            tuple[
-                int,
-                Sequence[int],
-                int | None,
-                int | None,
-                int | None,
-                int | None,
-                bool,
-                int | None,
-                int | None,
-                int | None,
-                int | None,
-                frozenset[int],
-            ],
-        ] = {}
+        self.reqs: dict[int, Qwen3PhaseStopLogitsProcessor._ReqState] = {}
         self.neg_inf_tensor = torch.tensor(
             -float("inf"), dtype=torch.float32, device=self.device
         )
@@ -362,23 +368,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         params: SamplingParams,
         _: list[int] | None,
         output_tok_ids: list[int],
-    ) -> (
-        tuple[
-            int,
-            Sequence[int],
-            int | None,
-            int | None,
-            int | None,
-            int | None,
-            bool,
-            int | None,
-            int | None,
-            int | None,
-            int | None,
-            frozenset[int],
-        ]
-        | None
-    ):
+    ) -> "Qwen3PhaseStopLogitsProcessor._ReqState | None":
         cfg = self._parse_phase_ban_config(params.extra_args)
         if cfg is None:
             return None
@@ -395,6 +385,10 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             open_paren_id,
             trailing_backtick_ids,
         ) = cfg
+        nudge = self._parse_citation_nudge_config(params.extra_args)
+        lt_id = lt_slash_id = bang_id = None
+        if nudge is not None:
+            lt_id, lt_slash_id, bang_id = nudge
         return (
             im_end_id,
             output_tok_ids,
@@ -408,15 +402,24 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             close_paren_id,
             open_paren_id,
             trailing_backtick_ids,
+            lt_id,
+            lt_slash_id,
+            bang_id,
         )
 
-    def _active_ban_reqs(self) -> list[tuple[int, list[int]]]:
-        from vllm.parser.qwen3_phase_stop import step_banned_ids
+    def _step_bans_and_deltas(
+        self,
+        prefix: Sequence[int],
+        state: "Qwen3PhaseStopLogitsProcessor._ReqState",
+    ) -> tuple[list[int], list[tuple[int, float]]]:
+        from vllm.parser.qwen3_phase_stop import (
+            step_banned_ids,
+            step_citation_logit_deltas,
+        )
 
-        active: list[tuple[int, list[int]]] = []
-        for req_idx, (
+        (
             im_end_id,
-            out_tok_ids,
+            _out,
             think_start,
             think_end,
             tool_start,
@@ -427,24 +430,37 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             close_paren_id,
             open_paren_id,
             trailing_backtick_ids,
-        ) in self.reqs.items():
-            banned = step_banned_ids(
-                out_tok_ids,
-                im_end_id=im_end_id,
-                think_start_id=think_start,
-                think_end_id=think_end,
-                tool_start_id=tool_start,
-                tool_end_id=tool_end,
-                initial_reasoning=initial,
-                backtick_id=backtick_id,
-                fence_id=fence_id,
-                trailing_backtick_ids=trailing_backtick_ids,
-                close_paren_id=close_paren_id,
-                open_paren_id=open_paren_id,
-            )
-            if banned:
-                active.append((req_idx, banned))
-        return active
+            lt_id,
+            lt_slash_id,
+            bang_id,
+        ) = state
+        banned = step_banned_ids(
+            prefix,
+            im_end_id=im_end_id,
+            think_start_id=think_start,
+            think_end_id=think_end,
+            tool_start_id=tool_start,
+            tool_end_id=tool_end,
+            initial_reasoning=initial,
+            backtick_id=backtick_id,
+            fence_id=fence_id,
+            trailing_backtick_ids=trailing_backtick_ids,
+            close_paren_id=close_paren_id,
+            open_paren_id=open_paren_id,
+        )
+        deltas = step_citation_logit_deltas(
+            prefix,
+            think_start_id=think_start,
+            think_end_id=think_end,
+            backtick_id=backtick_id,
+            fence_id=fence_id,
+            initial_reasoning=initial,
+            trailing_backtick_ids=trailing_backtick_ids,
+            lt_id=lt_id,
+            lt_slash_id=lt_slash_id,
+            bang_id=bang_id,
+        )
+        return banned, deltas
 
     def update_state(self, batch_update: BatchUpdate | None):
         process_dict_updates(self.reqs, batch_update, self.add_request)
@@ -452,19 +468,55 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
     def _device_tensor(self, data: list, dtype: torch.dtype) -> torch.Tensor:
         return async_tensor_h2d(data, device=self.device, dtype=dtype)
 
+    def _apply_bans_and_deltas(
+        self,
+        logits: torch.Tensor,
+        row_bans: list[int],
+        tok_bans: list[int],
+        row_deltas: list[int],
+        tok_deltas: list[int],
+        val_deltas: list[float],
+    ) -> torch.Tensor:
+        if row_bans:
+            logits.index_put_(
+                (
+                    self._device_tensor(row_bans, torch.int32),
+                    self._device_tensor(tok_bans, torch.int32),
+                ),
+                self.neg_inf_tensor,
+            )
+        if row_deltas:
+            logits.index_put_(
+                (
+                    self._device_tensor(row_deltas, torch.int32),
+                    self._device_tensor(tok_deltas, torch.int32),
+                ),
+                self._device_tensor(val_deltas, torch.float32),
+                accumulate=True,
+            )
+        return logits
+
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         # Recompute each step — output_tok_ids lists are live references.
-        active = self._active_ban_reqs()
-        if not active:
+        if not self.reqs:
             return logits
-        reqs = [r for r, ids in active for _ in ids]
-        toks = [t for _, ids in active for t in ids]
-        logits_slice = (
-            self._device_tensor(reqs, torch.int32),
-            self._device_tensor(toks, torch.int32),
+        row_bans: list[int] = []
+        tok_bans: list[int] = []
+        row_deltas: list[int] = []
+        tok_deltas: list[int] = []
+        val_deltas: list[float] = []
+        for req_idx, state in self.reqs.items():
+            banned, deltas = self._step_bans_and_deltas(state[1], state)
+            for tid in banned:
+                row_bans.append(req_idx)
+                tok_bans.append(tid)
+            for tid, delta in deltas:
+                row_deltas.append(req_idx)
+                tok_deltas.append(tid)
+                val_deltas.append(delta)
+        return self._apply_bans_and_deltas(
+            logits, row_bans, tok_bans, row_deltas, tok_deltas, val_deltas
         )
-        logits.index_put_(logits_slice, self.neg_inf_tensor)
-        return logits
 
     def apply_with_spec_decode(
         self,
@@ -478,31 +530,20 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         every draft row (legacy). With drafts, row ``k`` uses
         ``accepted + draft[:k]`` so `` `\n</think>`` cannot sneak through
         MTP as a single multi-token accept (production chatcmpl-8b9c).
+        Citation text-path deltas use the same per-row prefixes.
         """
-        from vllm.parser.qwen3_phase_stop import step_banned_ids
-
         if not self.reqs:
             return logits
 
         num_draft_arr = np.array(num_draft_tokens, dtype=np.int64)
         cumsum = np.concatenate([[0], np.cumsum(num_draft_arr)])
-        row_list: list[int] = []
-        tok_list: list[int] = []
+        row_bans: list[int] = []
+        tok_bans: list[int] = []
+        row_deltas: list[int] = []
+        tok_deltas: list[int] = []
+        val_deltas: list[float] = []
 
-        for req_idx, (
-            im_end_id,
-            out_tok_ids,
-            think_start,
-            think_end,
-            tool_start,
-            tool_end,
-            initial,
-            backtick_id,
-            fence_id,
-            close_paren_id,
-            open_paren_id,
-            trailing_backtick_ids,
-        ) in self.reqs.items():
+        for req_idx, state in self.reqs.items():
             n = int(num_draft_arr[req_idx])
             if n <= 0:
                 continue
@@ -512,37 +553,25 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                 if spec_token_ids is not None and req_idx < len(spec_token_ids)
                 else None
             )
-            accepted = list(out_tok_ids)
+            accepted = list(state[1])
             for k in range(n):
                 if draft is not None:
                     prefix: Sequence[int] = accepted + draft[:k]
                 else:
                     prefix = accepted
-                banned = step_banned_ids(
-                    prefix,
-                    im_end_id=im_end_id,
-                    think_start_id=think_start,
-                    think_end_id=think_end,
-                    tool_start_id=tool_start,
-                    tool_end_id=tool_end,
-                    initial_reasoning=initial,
-                    backtick_id=backtick_id,
-                    fence_id=fence_id,
-                    trailing_backtick_ids=trailing_backtick_ids,
-                    close_paren_id=close_paren_id,
-                    open_paren_id=open_paren_id,
-                )
+                banned, deltas = self._step_bans_and_deltas(prefix, state)
+                row = offset + k
                 for tid in banned:
-                    row_list.append(offset + k)
-                    tok_list.append(tid)
+                    row_bans.append(row)
+                    tok_bans.append(tid)
+                for tid, delta in deltas:
+                    row_deltas.append(row)
+                    tok_deltas.append(tid)
+                    val_deltas.append(delta)
 
-        if row_list:
-            logits_slice = (
-                async_tensor_h2d(row_list, device=self.device),
-                async_tensor_h2d(tok_list, device=self.device),
-            )
-            logits.index_put_(logits_slice, self.neg_inf_tensor)
-        return logits
+        return self._apply_bans_and_deltas(
+            logits, row_bans, tok_bans, row_deltas, tok_deltas, val_deltas
+        )
 
 
 def process_dict_updates(

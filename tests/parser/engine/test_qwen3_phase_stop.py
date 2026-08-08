@@ -5,6 +5,9 @@
 from unittest.mock import MagicMock
 
 from vllm.parser.qwen3_phase_stop import (
+    CITATION_BANG_PENALTY,
+    CITATION_LT_BOOST,
+    CITATION_NUDGE_XARG_KEY,
     PHASE_BAN_XARG_KEY,
     QWEN_END_OF_TEXT,
     QWEN_IM_END,
@@ -12,9 +15,12 @@ from vllm.parser.qwen3_phase_stop import (
     banned_ids_for_request,
     ends_with_dangling_backtick,
     is_in_reasoning_or_tool_phase,
+    parse_citation_nudge_config,
     parse_phase_ban_config,
     should_ban_im_end,
     should_ignore_stop_token,
+    step_banned_ids,
+    step_citation_logit_deltas,
 )
 
 _THINK_START = 10
@@ -30,6 +36,9 @@ _PAREN_BACKTICK = 43
 _DOUBLE_BACKTICK = 44
 _CLOSE_PAREN = 45
 _OPEN_PAREN = 46
+_LT = 50
+_LT_SLASH = 51
+_BANG = 0
 
 
 _VOCAB = {
@@ -48,6 +57,16 @@ _VOCAB = {
     "``": _DOUBLE_BACKTICK,
     ")": _CLOSE_PAREN,
     "(": _OPEN_PAREN,
+    "<": _LT,
+    "</": _LT_SLASH,
+    "!": _BANG,
+}
+
+_STRUCTURAL_SPECIALS = {
+    _THINK_START,
+    _THINK_END,
+    _TOOL_START,
+    _TOOL_END,
 }
 
 
@@ -175,17 +194,11 @@ class TestMergedBacktickStopGuard:
 
 
 class TestBacktickCitationIdsAllowed:
-    """A dangling backtick bans ``im_end`` + ``think_end`` only.
+    """Dangling backtick bans all structural specials + ``im_end``.
 
-    Banning the whole think/tool family after an opening `` ` `` knocked
-    the model off `` `<tool_call>` `` citations. But allowing ``think_end``
-    again re-opened the early-close path: the model samples a real
-    ``</think>`` id mid-citation and ends think (screenshot: "Treat `"
-    then nothing). Surgical rule — ban ``im_end`` and ``think_end``;
-    keep ``think_start`` / tool ids sampleable for tool-tag citations.
-
-    The ban covers a two-token window so `` `\n</think>`` (production
-    chatcmpl-a2c610 / MTP) cannot clear the guard via a newline.
+    Citations must use text/BPE (soft ``<`` / ``</`` boost); specials after
+    `` ` `` caused early think-close / ``Treat `\n!`` when TE was banned
+    alone. Two-token window still covers `` `\n</think>`` (MTP).
     """
 
     _NEWLINE = 198
@@ -198,54 +211,54 @@ class TestBacktickCitationIdsAllowed:
         apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
         return req.vllm_xargs
 
-    def test_reasoning_backtick_bans_think_end(self):
-        # Real </think> id right after " `" must not be sampleable.
+    def test_reasoning_backtick_bans_all_structural_specials(self):
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert _THINK_END in banned
-        assert _IM_END in banned
+        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
 
-    def test_reasoning_backtick_allows_tool_and_think_start(self):
-        banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert banned.isdisjoint({_THINK_START, _TOOL_START, _TOOL_END})
-
-    def test_answer_backtick_bans_im_end_and_think_end(self):
+    def test_answer_backtick_bans_all_structural_specials(self):
         ids = [_THINK_END, 1, _SPACE_BACKTICK]
-        banned = banned_ids_for_request(ids, self._cfg())
-        assert set(banned) == {_IM_END, _THINK_END}
+        banned = set(banned_ids_for_request(ids, self._cfg()))
+        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
 
-    def test_lone_backtick_allows_tool_ids(self):
+    def test_lone_backtick_bans_tool_ids(self):
         banned = set(banned_ids_for_request([1, _BACKTICK], self._cfg()))
-        assert _TOOL_START not in banned
+        assert _TOOL_START in banned
+        assert _TOOL_END in banned
         assert _THINK_END in banned
         assert _IM_END in banned
 
-    def test_backtick_newline_still_bans_think_end(self):
+    def test_backtick_newline_still_bans_specials(self):
         """Regression chatcmpl-a2c610: `` `\n</think>`` mid-citation."""
         banned = set(
             banned_ids_for_request([1, _BACKTICK, self._NEWLINE], self._cfg())
         )
-        assert _THINK_END in banned
-        assert _IM_END in banned
+        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
 
-    def test_merged_backtick_newline_still_bans_think_end(self):
+    def test_merged_backtick_newline_still_bans_specials(self):
         banned = set(
             banned_ids_for_request(
                 [1, _SPACE_BACKTICK, self._NEWLINE], self._cfg()
             )
         )
-        assert _THINK_END in banned
-        assert _IM_END in banned
+        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
 
-    def test_ban_sticky_one_token_then_reasoning_im_end_only(self):
-        # One token after backtick: still dangling (think_end + im_end).
+    def test_ban_sticky_one_token_then_all_specials(self):
+        # One token after backtick: still dangling.
         cfg = self._cfg()
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK, 2], cfg))
-        assert banned == {_IM_END, _THINK_END}
+        assert banned == _STRUCTURAL_SPECIALS | {_IM_END}
 
     def test_ban_is_non_sticky_after_two_tokens(self):
         # Two tokens later only the reasoning-phase im_end ban remains.
         cfg = self._cfg()
         assert banned_ids_for_request([1, _SPACE_BACKTICK, 2, 3], cfg) == [_IM_END]
+
+    def test_tools_allowed_again_after_window(self):
+        cfg = self._cfg()
+        banned = set(banned_ids_for_request([_THINK_END, 1, _SPACE_BACKTICK, 2, 3], cfg))
+        assert banned.isdisjoint({_TOOL_START, _TOOL_END, _THINK_START})
+        assert _THINK_END in banned  # post-close latch
+        assert _IM_END not in banned
 
     def test_stop_ignore_stays_reasoning_only(self):
         # Control: the backtick rule never rescues an already-sampled stop.
@@ -253,6 +266,96 @@ class TestBacktickCitationIdsAllowed:
         assert not should_ignore_stop_token(
             _IM_END, [_THINK_END, 1, _SPACE_BACKTICK], cfg
         )
+
+
+class TestCitationTextPathNudge:
+    """Soft ``<`` / ``</`` boost and ``!`` penalty only while dangling."""
+
+    _NEWLINE = 198
+
+    def _nudge_ids(self):
+        req = MagicMock()
+        req.logit_bias = None
+        req.bad_words = []
+        req.vllm_xargs = None
+        apply_endoftext_ban_to_request(req, _VOCAB, initial_reasoning=True)
+        assert CITATION_NUDGE_XARG_KEY in req.vllm_xargs
+        return parse_citation_nudge_config(req.vllm_xargs)
+
+    def test_apply_sets_citation_nudge_xarg(self):
+        lt, lt_slash, bang = self._nudge_ids()
+        assert lt == _LT
+        assert lt_slash == _LT_SLASH
+        assert bang == _BANG
+
+    def test_deltas_active_when_dangling(self):
+        deltas = dict(
+            step_citation_logit_deltas(
+                [1, _SPACE_BACKTICK],
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+                lt_id=_LT,
+                lt_slash_id=_LT_SLASH,
+                bang_id=_BANG,
+            )
+        )
+        assert deltas[_LT] == CITATION_LT_BOOST
+        assert deltas[_LT_SLASH] == CITATION_LT_BOOST
+        assert deltas[_BANG] == -CITATION_BANG_PENALTY
+
+    def test_deltas_empty_when_not_dangling(self):
+        assert (
+            step_citation_logit_deltas(
+                [1, _SPACE_BACKTICK, 2, 3],
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+                lt_id=_LT,
+                lt_slash_id=_LT_SLASH,
+                bang_id=_BANG,
+            )
+            == []
+        )
+
+    def test_spec_row_after_backtick_newline_bans_tool_and_think_end(self):
+        """MTP: draft ``[` , \\n, TE]`` bans TE + tool_start on dangling rows."""
+        accepted = [_THINK_END, 18307]
+        draft = [_SPACE_BACKTICK, self._NEWLINE, _THINK_END]
+        banned = set(
+            step_banned_ids(
+                accepted + draft[:2],
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+            )
+        )
+        assert {_THINK_END, _TOOL_START, _IM_END} <= banned
+        deltas = dict(
+            step_citation_logit_deltas(
+                accepted + draft[:1],
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+                lt_id=_LT,
+                lt_slash_id=_LT_SLASH,
+                bang_id=_BANG,
+            )
+        )
+        assert _LT in deltas
+        assert deltas[_BANG] < 0
 
 
 class TestThinkCitationAfterClose:
@@ -529,9 +632,9 @@ class TestRequestWiring:
             ]
         }
         banned = set(banned_ids_for_request([_THINK_END, _BACKTICK], extra))
-        assert {_IM_END, _THINK_END} <= banned
-        # Two-token window: one token after backtick still bans both.
-        assert {_IM_END, _THINK_END} <= set(
+        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
+        # Two-token window: one token after backtick still bans specials.
+        assert _STRUCTURAL_SPECIALS | {_IM_END} <= set(
             banned_ids_for_request([_THINK_END, _BACKTICK, 1], extra)
         )
         # Non-sticky for im_end; latch keeps think_end banned.
@@ -545,8 +648,6 @@ class TestRequestWiring:
         After the first think_end latch, row k=2 must see accepted+draft[:2]
         (dangling) and ban TE — same shape as chatcmpl-8b9c Treat/`/TE.
         """
-        from vllm.parser.qwen3_phase_stop import step_banned_ids
-
         newline = 198
         treat = 18307
         # Prior accepted output already closed think once.
@@ -567,8 +668,7 @@ class TestRequestWiring:
                 trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
             )
         )
-        assert _THINK_END in banned
-        assert _IM_END in banned
+        assert _STRUCTURAL_SPECIALS | {_IM_END} <= banned
         # Row 0 (before draft backtick): latch alone bans TE; im_end free.
         banned0 = set(
             step_banned_ids(
