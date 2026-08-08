@@ -614,6 +614,84 @@ class TestTrailingWhitespaceStripping:
         _assert_tag_visible(reasoning, "<tool_call>")
         assert content == ""
 
+    def test_whitespace_only_think_then_tool_is_none_reasoning(
+        self, mock_tokenizer, mock_request
+    ):
+        """Regression chatcmpl-bf28efb6: model emits ``\\n\\n</think>`` then
+        a tool call. Whitespace-only think must not become reasoning_content
+        (empty UI accordion); the tool must still parse.
+        """
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "Brave_Search_brave_web_search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            )
+        ]
+        mock_request.tools = tools
+        parser = Qwen3Parser(mock_tokenizer, tools=tools)
+        text = (
+            "\n\n</think>\n\n"
+            "<tool_call>\n"
+            "<function=Brave_Search_brave_web_search>\n"
+            "<parameter=query>\n"
+            'vllm PR "qwen3" "reasoning parser"\n'
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        reasoning, content, tool_calls = parser.parse(text, mock_request)
+        assert reasoning is None
+        assert tool_calls is not None
+        assert len(tool_calls) == 1
+        assert tool_calls[0].name == "Brave_Search_brave_web_search"
+
+        stream_parser = Qwen3Parser(mock_tokenizer, tools=tools)
+        chunks: list[tuple[str, list[int]]] = [
+            ("\n\n", [271]),
+            (
+                "</think>\n\n"
+                "<tool_call>\n"
+                "<function=Brave_Search_brave_web_search>\n"
+                "<parameter=query>\n"
+                'vllm PR "qwen3" "reasoning parser"\n'
+                "</parameter>\n"
+                "</function>\n"
+                "</tool_call>",
+                [_THINK_END_ID],
+            ),
+        ]
+        reasoning_parts: list[str] = []
+        names: list[str] = []
+        for delta_text, ids in chunks:
+            delta = stream_parser.parse_delta(
+                delta_text, ids, mock_request, finished=False
+            )
+            if delta is not None and delta.reasoning:
+                reasoning_parts.append(delta.reasoning)
+            if delta is not None and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    if tc.function and tc.function.name:
+                        names.append(tc.function.name)
+        flush = stream_parser.parse_delta("", [], mock_request, finished=True)
+        if flush is not None and flush.reasoning:
+            reasoning_parts.append(flush.reasoning)
+        if flush is not None and flush.tool_calls:
+            for tc in flush.tool_calls:
+                if tc.function and tc.function.name:
+                    names.append(tc.function.name)
+        assert "".join(reasoning_parts) == ""
+        assert "Brave_Search_brave_web_search" in names
+
 
 class TestStructuralTagProseInvariants:
     """PR-title / citation tags must stay visible text; tools must not fire."""
@@ -1293,7 +1371,7 @@ class TestMidReasoningCitations:
                 (2,),
             ],
         )
-        assert reasoning == "thinking. "
+        assert reasoning == "thinking."
         assert content == "Done"
 
     def test_real_think_end_still_ends_reasoning(self, parser):
@@ -1639,7 +1717,7 @@ class TestToolTagCitationServing:
         assert f"`{_fw_tag('<tool_call>')}`" in out.reasoning
         assert "<tool_call>" not in out.reasoning
         assert self._CITE_PRE in out.reasoning
-        assert '` as literal text"). ' in out.reasoning
+        assert '` as literal text").' in out.reasoning
         assert out.content == "Answer."
         assert out.tool_calls == []
 
@@ -1655,7 +1733,7 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert out.reasoning == "thinking. "
+        assert out.reasoning == "thinking."
         assert f"`{_fw_tag('<tool_call>')}`" in out.content
         assert "<tool_call>" not in out.content
         assert self._CITE_PRE in out.content
@@ -1694,7 +1772,7 @@ class TestToolTagCitationServing:
         )
         assert f"`{_fw_tag('<tool_call>')}`" in out.reasoning
         assert "<tool_call>" not in out.reasoning
-        assert '` as literal text"). ' in out.reasoning
+        assert '` as literal text").' in out.reasoning
         assert out.content == "Answer."
         assert out.tool_calls == []
 

@@ -255,7 +255,7 @@ def qwen3_config(
         transitions=transitions,
         arg_converter=_qwen3_arg_converter,
         stream_arg_deltas=True,
-        strip_trailing_reasoning_whitespace=False,
+        strip_trailing_reasoning_whitespace=True,
         tool_args_json=False,
         validate_tool_names=validate_tool_names,
         defer_reasoning_end=True,
