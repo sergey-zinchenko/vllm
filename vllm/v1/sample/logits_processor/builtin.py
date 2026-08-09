@@ -453,6 +453,8 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             open_paren_id=open_paren_id,
             bang_id=bang_id,
             newline_id=newline_id,
+            lt_id=lt_id,
+            lt_slash_id=lt_slash_id,
         )
         deltas = step_citation_logit_deltas(
             prefix,

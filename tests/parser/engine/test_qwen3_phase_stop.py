@@ -14,11 +14,13 @@ from vllm.parser.qwen3_phase_stop import (
     QWEN_MASK_BAD_WORDS,
     QWEN_MASK_END,
     QWEN_MASK_START,
+    THINK_TAG_LOOP_TE_BOOST,
     apply_endoftext_ban_to_request,
     banned_ids_for_request,
     ends_with_bang_newline_streak,
     ends_with_dangling_backtick,
     ends_with_failed_citation_tail,
+    ends_with_think_tag_citation_loop,
     has_real_think_end,
     is_citation_think_end_at,
     is_in_reasoning_or_tool_phase,
@@ -48,6 +50,12 @@ _LT = 50
 _LT_SLASH = 51
 _BANG = 0
 _NEWLINE = 198
+_GT = 52
+_SEP = 53
+_TAG_THINKING = 60
+_TAG_THOUGHT = 61
+_TAG_REASONING = 62
+_TAG_COT = 63
 
 
 _VOCAB = {
@@ -1210,3 +1218,99 @@ class TestEmptyStartBan:
         assert _THINK_END not in banned
         assert _CLOSE_PAREN not in banned
         assert _OPEN_PAREN not in banned
+
+
+class TestThinkTagCitationLoop:
+    """Break `` `</think>` / `</thinking>` / …`` attractors (chatcmpl-8521cc)."""
+
+    _LOOP_KW = dict(
+        think_start_id=_THINK_START,
+        think_end_id=_THINK_END,
+        tool_start_id=_TOOL_START,
+        tool_end_id=_TOOL_END,
+        initial_reasoning=True,
+        backtick_id=_BACKTICK,
+        trailing_backtick_ids=frozenset(),
+        newline_id=_NEWLINE,
+        lt_id=_LT,
+        lt_slash_id=_LT_SLASH,
+    )
+
+    @staticmethod
+    def _cite(tag_id: int) -> list[int]:
+        # `` `</tag>` / `` — mirrors prod BPE shape (bt, lt, body, gt, sep).
+        return [_BACKTICK, _LT, tag_id, _GT, _SEP]
+
+    def _loop_prefix(self, *, dangling: bool = True) -> list[int]:
+        tags = (_TAG_THINKING, _TAG_THOUGHT, _TAG_REASONING, _TAG_COT)
+        out: list[int] = [1, 2, 3]
+        for tag in tags:
+            out.extend(self._cite(tag))
+        # Close the last citation so the next opening `` ` `` is dangling.
+        out.append(_BACKTICK)
+        if dangling:
+            return out
+        out.extend([_LT, _TAG_THINKING, _GT, _SEP])
+        return out
+
+    def test_single_citation_is_not_loop(self):
+        prefix = [1, 2] + self._cite(_TAG_THINKING) + [_BACKTICK]
+        assert not ends_with_think_tag_citation_loop(prefix, **self._LOOP_KW)
+
+    def test_three_plus_cycles_is_loop(self):
+        prefix = self._loop_prefix()
+        assert ends_with_think_tag_citation_loop(prefix, **self._LOOP_KW)
+
+    def test_loop_not_detected_after_real_think_end(self):
+        prefix = [_THINK_END] + self._loop_prefix()
+        assert not ends_with_think_tag_citation_loop(prefix, **self._LOOP_KW)
+
+    def test_loop_stops_lt_nudge_and_boosts_think_end(self):
+        prefix = self._loop_prefix(dangling=True)
+        deltas = dict(
+            step_citation_logit_deltas(
+                prefix,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                initial_reasoning=True,
+                trailing_backtick_ids=frozenset(),
+                lt_id=_LT,
+                lt_slash_id=_LT_SLASH,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+                im_end_id=_IM_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+            )
+        )
+        assert _LT not in deltas
+        assert _LT_SLASH not in deltas
+        assert deltas[_THINK_END] == THINK_TAG_LOOP_TE_BOOST
+
+    def test_loop_bans_lt_and_keeps_think_end_samplable(self):
+        prefix = self._loop_prefix(dangling=True)
+        banned = set(
+            step_banned_ids(
+                prefix,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=frozenset(),
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+                lt_id=_LT,
+                lt_slash_id=_LT_SLASH,
+            )
+        )
+        assert _LT in banned
+        assert _LT_SLASH in banned
+        assert _THINK_END not in banned
+        # Still mid-reasoning / dangling: im_end stays banned.
+        assert _IM_END in banned

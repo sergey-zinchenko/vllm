@@ -80,6 +80,13 @@ BANG_STREAK_MIN_BANGS = 2
 # Max filler tokens after `` ` `` that still count as a failed citation
 # (prod chatcmpl-8822c896: `` `\n!`` then im_end).
 FAILED_CITATION_MAX_TAIL = 16
+# Think-tag citation loop (chatcmpl-8521cc): `` `</think>` / `</thinking>` / …``
+# repeated inside reasoning. citation_nudge's ``<`` boost feeds the cycle;
+# break by banning ``<`` / ``</`` and soft-boosting ``think_end``.
+THINK_TAG_LOOP_WINDOW = 256
+THINK_TAG_LOOP_MIN_CYCLES = 3
+THINK_TAG_CITATION_MAX_INNER = 8
+THINK_TAG_LOOP_TE_BOOST = 8.0
 
 PhaseBanConfig = tuple[
     int,
@@ -490,6 +497,68 @@ def ends_with_bang_newline_streak(
     return n >= min_len and bangs >= min_bangs
 
 
+def ends_with_think_tag_citation_loop(
+    output_token_ids: Sequence[int],
+    *,
+    think_start_id: int | None,
+    think_end_id: int | None,
+    tool_start_id: int | None,
+    tool_end_id: int | None,
+    initial_reasoning: bool = True,
+    backtick_id: int | None = None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
+    newline_id: int | None = None,
+    lt_id: int | None = None,
+    lt_slash_id: int | None = None,
+    window: int = THINK_TAG_LOOP_WINDOW,
+    min_cycles: int = THINK_TAG_LOOP_MIN_CYCLES,
+    max_inner: int = THINK_TAG_CITATION_MAX_INNER,
+) -> bool:
+    """True when reasoning is stuck citing think-close tags in backticks.
+
+    Counts closed `` `…` `` spans in the recent window whose interior
+    contains ``<`` / ``</``. A single legitimate citation is fine; ≥
+    *min_cycles* such spans (prod chatcmpl-8521cc) is the attractor that
+    burns ``thinking_token_budget`` while citation_nudge keeps boosting
+    ``<``.
+    """
+    if (lt_id is None and lt_slash_id is None) or not output_token_ids:
+        return False
+    if not is_in_reasoning_or_tool_phase(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        tool_start_id=tool_start_id,
+        tool_end_id=tool_end_id,
+        initial_reasoning=initial_reasoning,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        newline_id=newline_id,
+    ):
+        return False
+
+    def _is_backtick(tid: int) -> bool:
+        return tid == backtick_id or tid in trailing_backtick_ids
+
+    lt_ids = {tid for tid in (lt_id, lt_slash_id) if tid is not None}
+    seq = (
+        output_token_ids[-window:]
+        if len(output_token_ids) > window
+        else output_token_ids
+    )
+    bt_positions = [i for i, tid in enumerate(seq) if _is_backtick(tid)]
+    cycles = 0
+    for start, end in zip(bt_positions, bt_positions[1:]):
+        inner = seq[start + 1 : end]
+        if not inner or len(inner) > max_inner:
+            continue
+        if any(tid in lt_ids for tid in inner):
+            cycles += 1
+            if cycles >= min_cycles:
+                return True
+    return False
+
+
 def ends_with_failed_citation_tail(
     output_token_ids: Sequence[int],
     *,
@@ -594,6 +663,8 @@ def step_banned_ids(
     open_paren_id: int | None = None,
     bang_id: int | None = None,
     newline_id: int | None = None,
+    lt_id: int | None = None,
+    lt_slash_id: int | None = None,
 ) -> list[int]:
     """Token ids banned for the next decode step.
 
@@ -609,6 +680,9 @@ def step_banned_ids(
       token continues (otherwise ``im_end`` cuts the answer);
     - bang/newline streak: ``!`` hard-banned (does not touch ``think_end``)
       so ``!\n!\n`` attractors cannot run to ``max_tokens``;
+    - think-tag citation loop: ``<`` / ``</`` hard-banned and ``think_end``
+      kept samplable (even under dangling citation guard) so the cycle
+      can exit early (chatcmpl-8521cc);
     - empty start (no output yet, initial reasoning): ``think_end`` and
       bare ``)`` / ``(`` banned so polluted history cannot open with a
       lone paren or instantly close think.
@@ -647,16 +721,35 @@ def step_banned_ids(
         bang_id=bang_id,
         newline_id=newline_id,
     )
+    tag_loop = ends_with_think_tag_citation_loop(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        tool_start_id=tool_start_id,
+        tool_end_id=tool_end_id,
+        initial_reasoning=initial_reasoning,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        newline_id=newline_id,
+        lt_id=lt_id,
+        lt_slash_id=lt_slash_id,
+    )
     if im_end_id is not None and (in_reasoning or citation_guard):
         banned.append(im_end_id)
     if citation_guard:
         for tid in (
             think_start_id,
-            think_end_id,
+            # Keep TE samplable under a think-tag citation loop so the
+            # breaker can exit; otherwise dangling `` ` `` bans TE forever.
+            None if tag_loop else think_end_id,
             tool_start_id,
             tool_end_id,
             bang_id,
         ):
+            if tid is not None and tid not in banned:
+                banned.append(tid)
+    if tag_loop:
+        for tid in (lt_id, lt_slash_id):
             if tid is not None and tid not in banned:
                 banned.append(tid)
     if streak and bang_id is not None and bang_id not in banned:
@@ -704,15 +797,31 @@ def step_citation_logit_deltas(
     tool_end_id: int | None = None,
     lt_boost: float = CITATION_LT_BOOST,
     im_end_boost: float = BANG_STREAK_IM_END_BOOST,
+    think_end_boost: float = THINK_TAG_LOOP_TE_BOOST,
 ) -> list[tuple[int, float]]:
     """Finite logit deltas for citation text-path and bang-loop breakout.
 
     - Dangling / failed-citation tail: boost ``<`` / ``</`` so tags spell
       in BPE. ``!`` is hard-banned separately.
+    - Think-tag citation loop: do **not** boost ``<``; soft-boost
+      ``think_end`` so reasoning can exit early (chatcmpl-8521cc).
     - Bang/newline streak after think close: soft-boost ``im_end``, unless
       still inside a failed citation tail (do not push stop mid-`` `\n!``).
     """
     deltas: list[tuple[int, float]] = []
+    tag_loop = ends_with_think_tag_citation_loop(
+        output_token_ids,
+        think_start_id=think_start_id,
+        think_end_id=think_end_id,
+        tool_start_id=tool_start_id,
+        tool_end_id=tool_end_id,
+        initial_reasoning=initial_reasoning,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        newline_id=newline_id,
+        lt_id=lt_id,
+        lt_slash_id=lt_slash_id,
+    )
     citation_guard = ends_with_dangling_backtick(
         output_token_ids,
         think_start_id=think_start_id,
@@ -728,7 +837,10 @@ def step_citation_logit_deltas(
         bang_id=bang_id,
         newline_id=newline_id,
     )
-    if citation_guard:
+    if tag_loop:
+        if think_end_id is not None:
+            deltas.append((think_end_id, think_end_boost))
+    elif citation_guard:
         if lt_id is not None:
             deltas.append((lt_id, lt_boost))
         if lt_slash_id is not None and lt_slash_id != lt_id:
@@ -860,9 +972,9 @@ def banned_ids_for_request(
         trailing_backtick_ids,
     ) = cfg
     nudge = parse_citation_nudge_config(extra_args)
-    bang_id = newline_id = None
+    lt_id = lt_slash_id = bang_id = newline_id = None
     if nudge is not None:
-        _lt, _lt_slash, bang_id, newline_id = nudge
+        lt_id, lt_slash_id, bang_id, newline_id = nudge
     return step_banned_ids(
         output_token_ids,
         im_end_id=im_end_id,
@@ -878,6 +990,8 @@ def banned_ids_for_request(
         open_paren_id=open_paren_id,
         bang_id=bang_id,
         newline_id=newline_id,
+        lt_id=lt_id,
+        lt_slash_id=lt_slash_id,
     )
 
 
