@@ -67,6 +67,8 @@ _LT = "<"
 _LT_SLASH = "</"
 _BANG = "!"
 _NEWLINE = "\n"
+# HF Qwen BPE often stores newline as ``Ċ`` (U+010A), not ``"\n"``.
+_NEWLINE_VOCAB_KEYS = ("\n", "Ċ")
 
 # Soft logits nudge after a dangling opening `` ` `` (text-path citations).
 CITATION_LT_BOOST = 4.0
@@ -75,6 +77,9 @@ CITATION_LT_BOOST = 4.0
 BANG_STREAK_IM_END_BOOST = 8.0
 BANG_STREAK_MIN_LEN = 4
 BANG_STREAK_MIN_BANGS = 2
+# Max filler tokens after `` ` `` that still count as a failed citation
+# (prod chatcmpl-8822c896: `` `\n!`` then im_end).
+FAILED_CITATION_MAX_TAIL = 16
 
 PhaseBanConfig = tuple[
     int,
@@ -127,6 +132,18 @@ def resolve_vocab_token_id(vocab: Mapping[str, int], token: str) -> int | None:
     """Return token id from *vocab*, or ``None`` if absent."""
     tid = vocab.get(token)
     return int(tid) if tid is not None else None
+
+
+def resolve_newline_token_id(vocab: Mapping[str, int]) -> int | None:
+    """Id for a single newline token (``\\n`` or HF ``Ċ`` spelling)."""
+    for key in _NEWLINE_VOCAB_KEYS:
+        tid = resolve_vocab_token_id(vocab, key)
+        if tid is not None:
+            return tid
+    for tok, tid in vocab.items():
+        if tok.replace("Ċ", "\n") == "\n":
+            return int(tid)
+    return None
 
 
 def resolve_endoftext_token_id(vocab: Mapping[str, int]) -> int | None:
@@ -193,11 +210,12 @@ def apply_endoftext_ban_to_request(
         _id(_OPEN_PAREN),
         *trailing_backtick_token_ids(vocab, cache_key=vocab_cache_key),
     ]
+    newline_tid = resolve_newline_token_id(vocab)
     citation_nudge = [
         _id(_LT),
         _id(_LT_SLASH),
         _id(_BANG),
-        _id(_NEWLINE),
+        newline_tid if newline_tid is not None else -1,
     ]
     xargs = getattr(request, "vllm_xargs", None)
     if xargs is None:
@@ -370,6 +388,48 @@ def ends_with_bang_newline_streak(
     return n >= min_len and bangs >= min_bangs
 
 
+def ends_with_failed_citation_tail(
+    output_token_ids: Sequence[int],
+    *,
+    backtick_id: int | None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
+    bang_id: int | None = None,
+    newline_id: int | None = None,
+    max_tail: int = FAILED_CITATION_MAX_TAIL,
+) -> bool:
+    """True for `` `\\n!`` — open citation followed only by nl/bang.
+
+    The two-token dangling window clears once ``!`` is accepted, which
+    re-allowed ``im_end`` and cut the answer (chatcmpl-8822c896). Keep the
+    citation guard until a non-filler token continues the sentence. Cap the
+    filler suffix so an ancient backtick cannot stick the ban forever.
+    """
+    if not output_token_ids:
+        return False
+    filler: set[int] = set()
+    if bang_id is not None:
+        filler.add(bang_id)
+    if newline_id is not None:
+        filler.add(newline_id)
+    if not filler:
+        return False
+
+    def _is_backtick(tid: int) -> bool:
+        return tid == backtick_id or tid in trailing_backtick_ids
+
+    last_bt = -1
+    for i, tid in enumerate(output_token_ids):
+        if _is_backtick(tid):
+            last_bt = i
+    if last_bt < 0:
+        return False
+    suffix = output_token_ids[last_bt + 1 :]
+    # Empty suffix is plain dangling (handled separately).
+    if not suffix or len(suffix) > max_tail:
+        return False
+    return all(tid in filler for tid in suffix)
+
+
 def should_ban_im_end(
     output_token_ids: Sequence[int],
     *,
@@ -381,6 +441,8 @@ def should_ban_im_end(
     backtick_id: int | None = None,
     fence_id: int | None = None,
     trailing_backtick_ids: frozenset[int] = frozenset(),
+    bang_id: int | None = None,
+    newline_id: int | None = None,
 ) -> bool:
     """True when ``im_end`` must be banned for the next decode step."""
     if is_in_reasoning_or_tool_phase(
@@ -392,7 +454,7 @@ def should_ban_im_end(
         initial_reasoning=initial_reasoning,
     ):
         return True
-    return ends_with_dangling_backtick(
+    if ends_with_dangling_backtick(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
@@ -400,6 +462,14 @@ def should_ban_im_end(
         fence_id=fence_id,
         initial_reasoning=initial_reasoning,
         trailing_backtick_ids=trailing_backtick_ids,
+    ):
+        return True
+    return ends_with_failed_citation_tail(
+        output_token_ids,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        bang_id=bang_id,
+        newline_id=newline_id,
     )
 
 
@@ -430,6 +500,8 @@ def step_banned_ids(
       (``think_start`` / ``think_end`` / ``tool_start`` / ``tool_end``),
       and ``!`` banned for a two-token window — citations must use
       text/BPE (covers `` `\n</think>`` / ``Treat `\n!``);
+    - failed citation tail (`` `\n!``): same bans until a non-nl/bang
+      token continues (otherwise ``im_end`` cuts the answer);
     - bang/newline streak: ``!`` hard-banned (does not touch ``think_end``)
       so ``!\n!\n`` attractors cannot run to ``max_tokens``;
     - empty start (no output yet, initial reasoning): ``think_end`` and
@@ -454,14 +526,22 @@ def step_banned_ids(
         initial_reasoning=initial_reasoning,
         trailing_backtick_ids=trailing_backtick_ids,
     )
+    citation_tail = ends_with_failed_citation_tail(
+        output_token_ids,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        bang_id=bang_id,
+        newline_id=newline_id,
+    )
+    citation_guard = dangling or citation_tail
     streak = ends_with_bang_newline_streak(
         output_token_ids,
         bang_id=bang_id,
         newline_id=newline_id,
     )
-    if im_end_id is not None and (in_reasoning or dangling):
+    if im_end_id is not None and (in_reasoning or citation_guard):
         banned.append(im_end_id)
-    if dangling:
+    if citation_guard:
         for tid in (
             think_start_id,
             think_end_id,
@@ -514,13 +594,13 @@ def step_citation_logit_deltas(
 ) -> list[tuple[int, float]]:
     """Finite logit deltas for citation text-path and bang-loop breakout.
 
-    - Dangling backtick: boost ``<`` / ``</`` so tags spell in BPE.
-      ``!`` is hard-banned separately (soft penalty was not enough for
-      production ``Treat `\n!`` → ``!\n!\n``).
-    - Bang/newline streak after think close: soft-boost ``im_end``.
+    - Dangling / failed-citation tail: boost ``<`` / ``</`` so tags spell
+      in BPE. ``!`` is hard-banned separately.
+    - Bang/newline streak after think close: soft-boost ``im_end``, unless
+      still inside a failed citation tail (do not push stop mid-`` `\n!``).
     """
     deltas: list[tuple[int, float]] = []
-    if ends_with_dangling_backtick(
+    citation_guard = ends_with_dangling_backtick(
         output_token_ids,
         think_start_id=think_start_id,
         think_end_id=think_end_id,
@@ -528,7 +608,14 @@ def step_citation_logit_deltas(
         fence_id=fence_id,
         initial_reasoning=initial_reasoning,
         trailing_backtick_ids=trailing_backtick_ids,
-    ):
+    ) or ends_with_failed_citation_tail(
+        output_token_ids,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        bang_id=bang_id,
+        newline_id=newline_id,
+    )
+    if citation_guard:
         if lt_id is not None:
             deltas.append((lt_id, lt_boost))
         if lt_slash_id is not None and lt_slash_id != lt_id:
@@ -537,6 +624,13 @@ def step_citation_logit_deltas(
         im_end_id is not None
         and ends_with_bang_newline_streak(
             output_token_ids,
+            bang_id=bang_id,
+            newline_id=newline_id,
+        )
+        and not ends_with_failed_citation_tail(
+            output_token_ids,
+            backtick_id=backtick_id,
+            trailing_backtick_ids=trailing_backtick_ids,
             bang_id=bang_id,
             newline_id=newline_id,
         )
@@ -609,7 +703,7 @@ def phase_banned_token_ids(
             close_paren_id=resolve_vocab_token_id(vocab, _CLOSE_PAREN),
             open_paren_id=resolve_vocab_token_id(vocab, _OPEN_PAREN),
             bang_id=resolve_vocab_token_id(vocab, _BANG),
-            newline_id=resolve_vocab_token_id(vocab, _NEWLINE),
+            newline_id=resolve_newline_token_id(vocab),
         )
     )
     return banned

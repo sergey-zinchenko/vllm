@@ -18,9 +18,11 @@ from vllm.parser.qwen3_phase_stop import (
     banned_ids_for_request,
     ends_with_bang_newline_streak,
     ends_with_dangling_backtick,
+    ends_with_failed_citation_tail,
     is_in_reasoning_or_tool_phase,
     parse_citation_nudge_config,
     parse_phase_ban_config,
+    resolve_newline_token_id,
     should_ban_im_end,
     should_ignore_stop_token,
     step_banned_ids,
@@ -495,6 +497,203 @@ class TestBangNewlineStreak:
                 )
             )
             assert _BANG not in banned
+
+
+class TestNewlineResolve:
+    """Qwen HF vocab stores newline as ``Ċ``, not ``\"\\n\"``."""
+
+    def test_resolve_prefers_literal_newline(self):
+        assert resolve_newline_token_id({"\n": 198, "Ċ": 199}) == 198
+
+    def test_resolve_falls_back_to_c_dot(self):
+        assert resolve_newline_token_id({"Ċ": 198, "!": 0}) == 198
+
+    def test_apply_sets_newline_from_c_dot_vocab(self):
+        vocab = {k: v for k, v in _VOCAB.items() if k != "\n"}
+        vocab["Ċ"] = _NEWLINE
+        req = MagicMock()
+        req.logit_bias = None
+        req.bad_words = []
+        req.vllm_xargs = None
+        apply_endoftext_ban_to_request(req, vocab, initial_reasoning=True)
+        lt, lt_slash, bang, newline = parse_citation_nudge_config(req.vllm_xargs)
+        assert newline == _NEWLINE
+        assert bang == _BANG
+        assert lt == _LT
+        assert lt_slash == _LT_SLASH
+
+
+class TestFailedCitationTail:
+    """Regression chatcmpl-8822c896: `` `\\n!`` must not release ``im_end``."""
+
+    _DANGLING = _STRUCTURAL_SPECIALS | {_IM_END, _BANG}
+
+    def test_detector_backtick_newline_bang(self):
+        assert ends_with_failed_citation_tail(
+            [_THINK_END, 1, _BACKTICK, _NEWLINE, _BANG],
+            backtick_id=_BACKTICK,
+            bang_id=_BANG,
+            newline_id=_NEWLINE,
+        )
+        assert ends_with_failed_citation_tail(
+            [_THINK_END, _SPACE_BACKTICK, _NEWLINE, _BANG],
+            backtick_id=_BACKTICK,
+            trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+            bang_id=_BANG,
+            newline_id=_NEWLINE,
+        )
+
+    def test_detector_clears_on_continuation(self):
+        assert not ends_with_failed_citation_tail(
+            [_THINK_END, _BACKTICK, _NEWLINE, _BANG, 99],
+            backtick_id=_BACKTICK,
+            bang_id=_BANG,
+            newline_id=_NEWLINE,
+        )
+
+    def test_detector_false_without_backtick(self):
+        assert not ends_with_failed_citation_tail(
+            [_THINK_END, 1, _BANG, _NEWLINE],
+            backtick_id=_BACKTICK,
+            bang_id=_BANG,
+            newline_id=_NEWLINE,
+        )
+
+    def test_backtick_newline_bang_bans_im_end_and_bang(self):
+        ids = [_THINK_END, 1, _BACKTICK, _NEWLINE, _BANG]
+        banned = set(
+            step_banned_ids(
+                ids,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert self._DANGLING <= banned
+
+    def test_continuation_after_tail_frees_im_end(self):
+        ids = [_THINK_END, 1, _BACKTICK, _NEWLINE, _BANG, 99]
+        banned = set(
+            step_banned_ids(
+                ids,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert _IM_END not in banned
+        assert _BANG not in banned
+        assert _THINK_END in banned  # post-latch
+
+    def test_short_bang_without_backtick_not_guarded(self):
+        for ids in ([_THINK_END, 1, _BANG], [_THINK_END, 1, _BANG, _NEWLINE]):
+            assert not ends_with_failed_citation_tail(
+                ids,
+                backtick_id=_BACKTICK,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+            banned = set(
+                step_banned_ids(
+                    ids,
+                    im_end_id=_IM_END,
+                    think_start_id=_THINK_START,
+                    think_end_id=_THINK_END,
+                    tool_start_id=_TOOL_START,
+                    tool_end_id=_TOOL_END,
+                    initial_reasoning=True,
+                    backtick_id=_BACKTICK,
+                    bang_id=_BANG,
+                    newline_id=_NEWLINE,
+                )
+            )
+            assert _IM_END not in banned
+            assert _BANG not in banned
+
+    def test_streak_on_citation_tail_does_not_boost_im_end(self):
+        ids = [
+            _THINK_END,
+            _BACKTICK,
+            _NEWLINE,
+            _BANG,
+            _NEWLINE,
+            _BANG,
+            _NEWLINE,
+        ]
+        assert ends_with_failed_citation_tail(
+            ids,
+            backtick_id=_BACKTICK,
+            bang_id=_BANG,
+            newline_id=_NEWLINE,
+        )
+        deltas = dict(
+            step_citation_logit_deltas(
+                ids,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                backtick_id=_BACKTICK,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+                im_end_id=_IM_END,
+                lt_id=_LT,
+                lt_slash_id=_LT_SLASH,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+            )
+        )
+        assert _IM_END not in deltas
+        assert deltas[_LT] == CITATION_LT_BOOST
+
+    def test_mtp_row_after_backtick_newline_still_bans_bang(self):
+        """MTP: accepted+draft[:2] == `` `\\n``; next draft bang stays banned."""
+        accepted = [_THINK_END, 18307]
+        draft = [_SPACE_BACKTICK, _NEWLINE, _BANG]
+        banned = set(
+            step_banned_ids(
+                accepted + draft[:2],
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert {_IM_END, _BANG, _THINK_END} <= banned
+        # After draft bang accepted into prefix: citation tail still guards.
+        banned_tail = set(
+            step_banned_ids(
+                accepted + draft[:3],
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                trailing_backtick_ids=frozenset({_SPACE_BACKTICK}),
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert {_IM_END, _BANG} <= banned_tail
 
 
 class TestThinkCitationAfterClose:
