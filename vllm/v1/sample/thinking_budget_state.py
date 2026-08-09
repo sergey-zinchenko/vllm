@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm.parser.qwen3_phase_stop import (
+    is_citation_think_end_sequence_at,
+    parse_citation_nudge_config,
+    parse_phase_ban_config,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.sample.logits_processor.interface import (
@@ -91,7 +96,11 @@ class ThinkingBudgetStateHolder:
             thinking_token_budget = params.thinking_token_budget
             if thinking_token_budget is not None:
                 self._state[index] = self._init_state_entry(
-                    prompt_tok_ids, thinking_token_budget
+                    prompt_tok_ids,
+                    thinking_token_budget,
+                    citation_skip=self._citation_skip_from_extra_args(
+                        params.extra_args
+                    ),
                 )
                 self._state[index]["output_tok_ids"] = output_tok_ids
                 self._state[index]["spec_token_ids"] = []
@@ -168,9 +177,68 @@ class ThinkingBudgetStateHolder:
                 return i
         return -1
 
-    def _init_state_entry(
-        self, prompt_tok_ids: list[int] | None, thinking_token_budget: int
+    @staticmethod
+    def _citation_skip_from_extra_args(
+        extra_args: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        """Backtick / newline ids for ignoring citation-shaped think ends."""
+        backtick_id: int | None = None
+        trailing: frozenset[int] = frozenset()
+        newline_id: int | None = None
+        cfg = parse_phase_ban_config(extra_args)
+        if cfg is not None:
+            backtick_id = cfg[6]
+            trailing = cfg[10]
+        nudge = parse_citation_nudge_config(extra_args)
+        if nudge is not None:
+            newline_id = nudge[3]
+        return {
+            "citation_backtick_id": backtick_id,
+            "citation_trailing_backtick_ids": trailing,
+            "citation_newline_id": newline_id,
+        }
+
+    def _find_last_real_think_end_index(
+        self, target_list: list[int], state: dict[str, Any]
+    ) -> int:
+        """Last non-citation ``think_end`` index, or ``-1``.
+
+        `` `</think>`` / `` `\\n</think>`` must not exit the budget countdown
+        (chatcmpl-a0f7aa7: citation TE left forcing off while parser stayed
+        in REASONING).
+        """
+        token_ids = self.think_end_token_ids
+        if not token_ids:
+            return -1
+        backtick_id = state.get("citation_backtick_id")
+        trailing = state.get("citation_trailing_backtick_ids", frozenset())
+        newline_id = state.get("citation_newline_id")
+        for i in range(len(target_list) - len(token_ids), -1, -1):
+            if list(target_list[i : i + len(token_ids)]) != token_ids:
+                continue
+            if is_citation_think_end_sequence_at(
+                target_list,
+                i,
+                token_ids,
+                backtick_id=backtick_id,
+                trailing_backtick_ids=trailing,
+                newline_id=newline_id,
+            ):
+                continue
+            return i
+        return -1
+
+    def _init_state_entry(
+        self,
+        prompt_tok_ids: list[int] | None,
+        thinking_token_budget: int,
+        citation_skip: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        citation = citation_skip or {
+            "citation_backtick_id": None,
+            "citation_trailing_backtick_ids": frozenset(),
+            "citation_newline_id": None,
+        }
         if prompt_tok_ids is None:
             last_start = -1
             last_end = -1
@@ -188,8 +256,11 @@ class ThinkingBudgetStateHolder:
             last_start = self._find_last_sequence_index(
                 prompt_tok_ids, self.think_start_token_ids
             )
-            last_end = self._find_last_sequence_index(
-                prompt_tok_ids, self.think_end_token_ids
+            # Prompt scan: no citation skip state yet on a bare list — use
+            # the same ids from *citation* so history citations do not
+            # look like a closed think block.
+            last_end = self._find_last_real_think_end_index(
+                prompt_tok_ids, citation
             )
             in_think = last_start > last_end
             # load metrics such as think count, start thinking
@@ -225,6 +296,7 @@ class ThinkingBudgetStateHolder:
             "bonus_token_forced": False,
             "continue_thinking": continue_thinking,
             "scan_offset": 0,
+            **citation,
         }
 
     def _update_think_state(self, state: dict[str, Any]) -> None:
@@ -247,12 +319,11 @@ class ThinkingBudgetStateHolder:
             state["start_thinking"] = start_thinking
         if state["end_thinking"] == -1:
             scan_offset = state.get("scan_offset", 0)
-            output_slice = state.get("output_tok_ids", [])[scan_offset:]
-            end_thinking = self._find_last_sequence_index(
-                output_slice, self.think_end_token_ids
-            )
-            if end_thinking >= 0:
-                end_thinking += scan_offset
+            # Lookbehind for `` `\\n</think>`` needs the full output prefix.
+            full_output = state.get("output_tok_ids", [])
+            end_thinking = self._find_last_real_think_end_index(full_output, state)
+            if end_thinking >= 0 and end_thinking < scan_offset:
+                end_thinking = -1
             state["end_thinking"] = end_thinking
 
         if (

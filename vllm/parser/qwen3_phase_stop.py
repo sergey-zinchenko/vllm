@@ -279,6 +279,97 @@ def parse_phase_ban_config(
     )
 
 
+def is_citation_think_end_at(
+    output_token_ids: Sequence[int],
+    index: int,
+    *,
+    think_end_id: int | None,
+    backtick_id: int | None = None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
+    newline_id: int | None = None,
+) -> bool:
+    """True when TE at *index* is a `` `</think>`` / `` `\\n</think>`` citation.
+
+    Production chatcmpl-a0f7aa7: ``[backtick, nl, TE]`` was latched as a real
+    think close → further TE banned while the parser stayed in REASONING.
+    """
+    if (
+        think_end_id is None
+        or index < 0
+        or index >= len(output_token_ids)
+        or output_token_ids[index] != think_end_id
+    ):
+        return False
+
+    def _is_backtick(tid: int) -> bool:
+        return tid == backtick_id or tid in trailing_backtick_ids
+
+    if index >= 1 and _is_backtick(output_token_ids[index - 1]):
+        return True
+    return (
+        index >= 2
+        and newline_id is not None
+        and output_token_ids[index - 1] == newline_id
+        and _is_backtick(output_token_ids[index - 2])
+    )
+
+
+def is_citation_think_end_sequence_at(
+    output_token_ids: Sequence[int],
+    start: int,
+    end_token_ids: Sequence[int],
+    *,
+    backtick_id: int | None = None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
+    newline_id: int | None = None,
+) -> bool:
+    """Citation check for a multi-token think-end sequence starting at *start*."""
+    if not end_token_ids or start < 0:
+        return False
+    end_index = start + len(end_token_ids) - 1
+    if end_index >= len(output_token_ids):
+        return False
+    if list(output_token_ids[start : start + len(end_token_ids)]) != list(
+        end_token_ids
+    ):
+        return False
+    # Use the first TE token index for the backtick/nl lookbehind.
+    return is_citation_think_end_at(
+        output_token_ids,
+        start,
+        think_end_id=int(end_token_ids[0]),
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        newline_id=newline_id,
+    )
+
+
+def has_real_think_end(
+    output_token_ids: Sequence[int],
+    *,
+    think_end_id: int | None,
+    backtick_id: int | None = None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
+    newline_id: int | None = None,
+) -> bool:
+    """True when a non-citation ``think_end`` appears in *output_token_ids*."""
+    if think_end_id is None:
+        return False
+    for i, tid in enumerate(output_token_ids):
+        if tid != think_end_id:
+            continue
+        if not is_citation_think_end_at(
+            output_token_ids,
+            i,
+            think_end_id=think_end_id,
+            backtick_id=backtick_id,
+            trailing_backtick_ids=trailing_backtick_ids,
+            newline_id=newline_id,
+        ):
+            return True
+    return False
+
+
 def is_in_reasoning_or_tool_phase(
     output_token_ids: Sequence[int],
     *,
@@ -287,16 +378,18 @@ def is_in_reasoning_or_tool_phase(
     tool_start_id: int | None,
     tool_end_id: int | None,
     initial_reasoning: bool = True,
+    backtick_id: int | None = None,
+    trailing_backtick_ids: frozenset[int] = frozenset(),
+    newline_id: int | None = None,
 ) -> bool:
     """Heuristic phase detection from accepted output token ids.
 
     Returns ``True`` when ``im_end`` must be banned (still inside think).
 
-    One-way latch: after the first ``think_end`` the phase never re-enters
-    reasoning. A generation has at most one legitimate think block
-    (post-tool re-think is a separate request), so a later ``think_start``
-    id is a citation in the answer — re-arming the ban on it made
-    ``im_end`` unbannable forever (endless generation / rewritten tails).
+    One-way latch: after the first **real** ``think_end`` the phase never
+    re-enters reasoning. Citation-shaped `` `</think>`` / `` `\\n</think>``
+    are ignored so a sticky parser abort cannot latch the sampler closed
+    (chatcmpl-a0f7aa7 runaway reasoning).
 
     ``tool_start_id`` / ``tool_end_id`` are accepted for config compatibility
     but do not affect the ban: unpaired ``<tool_call>`` in prose must not
@@ -306,12 +399,21 @@ def is_in_reasoning_or_tool_phase(
     in_reasoning = initial_reasoning
     think_closed = False
 
-    for tid in output_token_ids:
+    for i, tid in enumerate(output_token_ids):
         if think_start_id is not None and tid == think_start_id:
             if not think_closed:
                 in_reasoning = True
             continue
         if think_end_id is not None and tid == think_end_id:
+            if is_citation_think_end_at(
+                output_token_ids,
+                i,
+                think_end_id=think_end_id,
+                backtick_id=backtick_id,
+                trailing_backtick_ids=trailing_backtick_ids,
+                newline_id=newline_id,
+            ):
+                continue
             in_reasoning = False
             think_closed = True
             continue
@@ -334,9 +436,9 @@ def ends_with_dangling_backtick(
     Matches the lone `` ` `` id and merged BPE forms (``" `"``, ``"(`"``
     ...) whose text ends with exactly one backtick — prose openings almost
     never tokenize as the bare backtick, and the truncation happens right
-    after those merged forms.     Applies inside reasoning too: the ban covers ``im_end`` and all
-    structural specials (think/tool); citations must use text/BPE, with
-    a soft ``<`` / ``</`` boost and a hard ``!`` ban (see
+    after those merged forms. Applies inside reasoning too: the ban covers
+    ``im_end`` and all structural specials (think/tool); citations must use
+    text/BPE, with a soft ``<`` / ``</`` boost and a hard ``!`` ban (see
     ``step_citation_logit_deltas`` / ``step_banned_ids``).
 
     Deliberately **not** span parity: counting one vocab id sees only one
@@ -452,6 +554,9 @@ def should_ban_im_end(
         tool_start_id=tool_start_id,
         tool_end_id=tool_end_id,
         initial_reasoning=initial_reasoning,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        newline_id=newline_id,
     ):
         return True
     if ends_with_dangling_backtick(
@@ -516,6 +621,9 @@ def step_banned_ids(
         tool_start_id=tool_start_id,
         tool_end_id=tool_end_id,
         initial_reasoning=initial_reasoning,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        newline_id=newline_id,
     )
     dangling = ends_with_dangling_backtick(
         output_token_ids,
@@ -553,15 +661,20 @@ def step_banned_ids(
                 banned.append(tid)
     if streak and bang_id is not None and bang_id not in banned:
         banned.append(bang_id)
-    # One-way latch: after the first think close appears in output, never
-    # sample think_end again (chatcmpl-8b9c: ``Treat `\n</think>`` mid-answer).
-    # Require a seen think_end so content-only turns (initial_reasoning=False)
-    # are not locked out of an optional first close.
+    # One-way latch: after the first *real* think close, never sample
+    # think_end again (chatcmpl-8b9c: ``Treat `\n</think>`` mid-answer).
+    # Citation-shaped TE must not latch (chatcmpl-a0f7aa7 split-brain).
     if (
         not in_reasoning
         and think_end_id is not None
         and think_end_id not in banned
-        and any(tid == think_end_id for tid in output_token_ids)
+        and has_real_think_end(
+            output_token_ids,
+            think_end_id=think_end_id,
+            backtick_id=backtick_id,
+            trailing_backtick_ids=trailing_backtick_ids,
+            newline_id=newline_id,
+        )
     ):
         banned.append(think_end_id)
     if not output_token_ids and initial_reasoning:
@@ -641,6 +754,9 @@ def step_citation_logit_deltas(
             tool_start_id=tool_start_id,
             tool_end_id=tool_end_id,
             initial_reasoning=initial_reasoning,
+            backtick_id=backtick_id,
+            trailing_backtick_ids=trailing_backtick_ids,
+            newline_id=newline_id,
         )
     ):
         deltas.append((im_end_id, im_end_boost))
@@ -788,14 +904,18 @@ def should_ignore_stop_token(
         tool_start,
         tool_end,
         initial,
-        _backtick_id,
+        backtick_id,
         _fence_id,
         _close_paren_id,
         _open_paren_id,
-        _trailing_backtick_ids,
+        trailing_backtick_ids,
     ) = cfg
     if token_id != im_end_id:
         return False
+    newline_id = None
+    nudge = parse_citation_nudge_config(extra_args)
+    if nudge is not None:
+        newline_id = nudge[3]
     return is_in_reasoning_or_tool_phase(
         output_token_ids_before,
         think_start_id=think_start,
@@ -803,4 +923,7 @@ def should_ignore_stop_token(
         tool_start_id=tool_start,
         tool_end_id=tool_end,
         initial_reasoning=initial,
+        backtick_id=backtick_id,
+        trailing_backtick_ids=trailing_backtick_ids,
+        newline_id=newline_id,
     )

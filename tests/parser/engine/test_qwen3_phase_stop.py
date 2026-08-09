@@ -19,6 +19,8 @@ from vllm.parser.qwen3_phase_stop import (
     ends_with_bang_newline_streak,
     ends_with_dangling_backtick,
     ends_with_failed_citation_tail,
+    has_real_think_end,
+    is_citation_think_end_at,
     is_in_reasoning_or_tool_phase,
     parse_citation_nudge_config,
     parse_phase_ban_config,
@@ -133,6 +135,124 @@ class TestPhaseDetection:
         )
 
 
+class TestCitationThinkEndLatch:
+    """Citation-shaped TE must not latch phase closed (chatcmpl-a0f7aa7).
+
+    Parser sticky-aborts `` `\n</think>`` and stays in REASONING, but the
+    special id is already in ``output_token_ids``. Treating it as a real
+    close bans further TE and disables thinking_budget force — runaway.
+    """
+
+    _TRAILING = frozenset({_SPACE_BACKTICK})
+
+    def test_backtick_nl_te_is_citation(self):
+        ids = [_THINK_START, 1, _BACKTICK, _NEWLINE, _THINK_END]
+        assert is_citation_think_end_at(
+            ids,
+            len(ids) - 1,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            trailing_backtick_ids=self._TRAILING,
+            newline_id=_NEWLINE,
+        )
+        assert not has_real_think_end(
+            ids,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            trailing_backtick_ids=self._TRAILING,
+            newline_id=_NEWLINE,
+        )
+
+    def test_backtick_te_is_citation(self):
+        ids = [_THINK_START, 1, _BACKTICK, _THINK_END]
+        assert is_citation_think_end_at(
+            ids,
+            len(ids) - 1,
+            think_end_id=_THINK_END,
+            backtick_id=_BACKTICK,
+            newline_id=_NEWLINE,
+        )
+
+    def test_citation_te_keeps_reasoning_phase(self):
+        ids = [_THINK_START, 1, _BACKTICK, _NEWLINE, _THINK_END, 2]
+        assert is_in_reasoning_or_tool_phase(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            tool_start_id=_TOOL_START,
+            tool_end_id=_TOOL_END,
+            initial_reasoning=True,
+            backtick_id=_BACKTICK,
+            trailing_backtick_ids=self._TRAILING,
+            newline_id=_NEWLINE,
+        )
+
+    def test_real_te_still_closes(self):
+        ids = [_THINK_START, 1, _THINK_END, 2]
+        assert not is_in_reasoning_or_tool_phase(
+            ids,
+            think_start_id=_THINK_START,
+            think_end_id=_THINK_END,
+            tool_start_id=_TOOL_START,
+            tool_end_id=_TOOL_END,
+            initial_reasoning=True,
+            backtick_id=_BACKTICK,
+            newline_id=_NEWLINE,
+        )
+
+    def test_citation_te_does_not_post_latch_ban(self):
+        """After citation TE only, further TE must remain samplable."""
+        ids = [_THINK_START, 1, _BACKTICK, _NEWLINE, _THINK_END, 2]
+        banned = set(
+            step_banned_ids(
+                ids,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=self._TRAILING,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert _IM_END in banned  # still reasoning
+        assert _THINK_END not in banned  # not latched closed
+
+    def test_real_te_after_citation_latches(self):
+        ids = [
+            _THINK_START,
+            1,
+            _BACKTICK,
+            _NEWLINE,
+            _THINK_END,
+            2,
+            _THINK_END,
+            3,
+        ]
+        banned = set(
+            step_banned_ids(
+                ids,
+                im_end_id=_IM_END,
+                think_start_id=_THINK_START,
+                think_end_id=_THINK_END,
+                tool_start_id=_TOOL_START,
+                tool_end_id=_TOOL_END,
+                initial_reasoning=True,
+                backtick_id=_BACKTICK,
+                fence_id=_FENCE,
+                trailing_backtick_ids=self._TRAILING,
+                bang_id=_BANG,
+                newline_id=_NEWLINE,
+            )
+        )
+        assert _IM_END not in banned
+        assert _THINK_END in banned
+
+
 class TestMergedBacktickStopGuard:
     """Merged trailing-backtick BPE tokens must arm the im_end ban window.
 
@@ -221,12 +341,12 @@ class TestBacktickCitationIdsAllowed:
 
     def test_reasoning_backtick_bans_all_structural_specials(self):
         banned = set(banned_ids_for_request([1, _SPACE_BACKTICK], self._cfg()))
-        assert self._DANGLING <= banned
+        assert banned >= self._DANGLING
 
     def test_answer_backtick_bans_all_structural_specials(self):
         ids = [_THINK_END, 1, _SPACE_BACKTICK]
         banned = set(banned_ids_for_request(ids, self._cfg()))
-        assert self._DANGLING <= banned
+        assert banned >= self._DANGLING
 
     def test_lone_backtick_bans_tool_ids(self):
         banned = set(banned_ids_for_request([1, _BACKTICK], self._cfg()))
@@ -241,13 +361,13 @@ class TestBacktickCitationIdsAllowed:
         banned = set(
             banned_ids_for_request([1, _BACKTICK, _NEWLINE], self._cfg())
         )
-        assert self._DANGLING <= banned
+        assert banned >= self._DANGLING
 
     def test_merged_backtick_newline_still_bans_specials(self):
         banned = set(
             banned_ids_for_request([1, _SPACE_BACKTICK, _NEWLINE], self._cfg())
         )
-        assert self._DANGLING <= banned
+        assert banned >= self._DANGLING
 
     def test_ban_sticky_one_token_then_all_specials(self):
         # One token after backtick: still dangling.
@@ -262,7 +382,11 @@ class TestBacktickCitationIdsAllowed:
 
     def test_tools_allowed_again_after_window(self):
         cfg = self._cfg()
-        banned = set(banned_ids_for_request([_THINK_END, 1, _SPACE_BACKTICK, 2, 3], cfg))
+        banned = set(
+            banned_ids_for_request(
+                [_THINK_END, 1, _SPACE_BACKTICK, 2, 3], cfg
+            )
+        )
         assert banned.isdisjoint({_TOOL_START, _TOOL_END, _THINK_START, _BANG})
         assert _THINK_END in banned  # post-close latch
         assert _IM_END not in banned
@@ -575,7 +699,7 @@ class TestFailedCitationTail:
                 newline_id=_NEWLINE,
             )
         )
-        assert self._DANGLING <= banned
+        assert banned >= self._DANGLING
 
     def test_continuation_after_tail_frees_im_end(self):
         ids = [_THINK_END, 1, _BACKTICK, _NEWLINE, _BANG, 99]

@@ -433,28 +433,13 @@ class StreamingParserEngine:
                 text = text.replace(lit, escaped)
         return text
 
-    @staticmethod
-    def _neutralize_tag_literals(text: str, literals: list[str]) -> str:
-        """Replace ASCII ``<>`` with fullwidth so client tag scanners miss.
-
-        U+FF1C/U+FF1E look nearly identical in UI fonts but break both
-        exact ``<tool_call>`` matches and loose ``/<[^>]+>/`` regexes.
-        ZWSP-after-``<`` was not enough for the latter.
-        """
-        for lit in literals:
-            if lit in text:
-                text = text.replace(lit, lit.replace("<", "＜").replace(">", "＞"))
-        return text
-
     def _escape_and_feed(self, text: str, *, escape: bool = True) -> str:
         """Update markdown code state and transform structural tag literals.
 
-        HTML entities are not interpreted in markdown code spans, so tags
-        inside `` `...` `` / ```...``` are neutralized with fullwidth
-        brackets instead of escaped: rendering is nearly identical, but
-        raw-stream clients that scan for ASCII tool markup before
-        markdown rendering no longer eat the citation (empty-block
-        artifact). Outside code, tags are escaped for UI-safe prose when
+        Inside `` `...` `` / ```...``` tags are HTML-escaped (``&lt;…&gt;``):
+        ASCII scanners miss the raw literal, and clients render the citation
+        instead of an empty code block (fullwidth ``＜…＞`` was invisible in
+        several UIs). Outside code, tags are escaped for UI-safe prose when
         *escape* is True and kept raw otherwise.
         """
         if not text:
@@ -472,9 +457,7 @@ class StreamingParserEngine:
                 return
             chunk = "".join(seg)
             seg.clear()
-            if literals and self._in_markdown_code():
-                chunk = self._neutralize_tag_literals(chunk, literals)
-            elif do_escape and literals:
+            if literals and (self._in_markdown_code() or do_escape):
                 chunk = self._escape_tag_literals(chunk, literals)
             out.append(chunk)
 
@@ -534,7 +517,7 @@ class StreamingParserEngine:
 
         # Inside markdown code: structural tags are inert prose — except
         # THINK_END (fence and inline). An unclosed ``` or open `` ` ``
-        # would otherwise swallow ``</think>`` as fullwidth code prose and
+        # would otherwise swallow ``</think>`` as escaped code prose and
         # leave the answer stuck in reasoning (chatcmpl-86dedb fence;
         # chatcmpl-892494 inline citation of the special id). Text/BPE
         # `` `</think>` `` citations still go through THINK_END_PENDING
@@ -876,10 +859,10 @@ class StreamingParserEngine:
                 self._note_reasoning_content(text)
             elif content_type == EventType.TEXT_CHUNK:
                 # No prose escaping in the answer, but code-span tag
-                # literals still get fullwidth-neutralized — unless this
-                # content is re-fed to a tool engine with the original
-                # token ids (skip_tool_parsing), where transforming
-                # would break the id/text anchoring of its scanner.
+                # literals are still HTML-escaped — unless this content
+                # is re-fed to a tool engine with the original token ids
+                # (skip_tool_parsing), where transforming would break
+                # the id/text anchoring of its scanner.
                 if self.skip_tool_parsing:
                     self._feed_markdown_state(text)
                 else:

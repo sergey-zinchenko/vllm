@@ -54,20 +54,11 @@ def _esc_tag(tag: str) -> str:
     return tag.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-_FW_LT = "＜"
-_FW_GT = "＞"
-
-
-def _fw_tag(tag: str) -> str:
-    """Fullwidth-bracket form emitted inside markdown code spans."""
-    return tag.replace("<", _FW_LT).replace(">", _FW_GT)
-
-
 def _assert_tag_visible(text: str | None, tag: str) -> None:
-    """Tag must appear as raw, escaped or fullwidth prose (never dropped)."""
+    """Tag must appear as raw or HTML-escaped prose (never dropped)."""
     assert text is not None
-    assert tag in text or _esc_tag(tag) in text or _fw_tag(tag) in text, (
-        f"expected {tag!r} (raw/escaped/fullwidth) in {text!r}"
+    assert tag in text or _esc_tag(tag) in text, (
+        f"expected {tag!r} (raw/escaped) in {text!r}"
     )
 
 
@@ -1069,7 +1060,7 @@ class TestMarkdownInertStructuralTags:
         """Text `` `<tool_call>` `` in reasoning must not emit tool_calls.
 
         Citation text-path after dangling backtick: markdown-inert keeps
-        the tag as fullwidth prose (no TOOL_PREAMBLE / no events).
+        the tag as escaped prose (no TOOL_PREAMBLE / no events).
         """
         from tests.parser.engine.streaming_helpers import (
             collect_content,
@@ -1152,7 +1143,7 @@ class TestMarkdownInertStructuralTags:
         """Special ``</think>`` inside open `` ` `` must leave reasoning.
 
         Production chatcmpl-892494: model cited the tag after an opening
-        backtick; markdown-inert fullwidth kept the FSM in REASONING while
+        backtick; markdown-inert escaping kept the FSM in REASONING while
         the sampler latch closed think — entire answer streamed as reasoning.
         Special-id TE in code force-commits; closing `` ` `` + Uppercase
         answer must land in content.
@@ -1393,7 +1384,7 @@ class TestMarkdownInertStructuralTags:
         """Unclosed ``` must not make ``</think>`` inert (chatcmpl-86dedb…).
 
         Production: model opened a fence while still thinking, never closed
-        it, then emitted special ``</think>`` — tag was fullwidth-neutralized
+        it, then emitted special ``</think>`` — tag was HTML-escaped
         as code prose and the Russian answer stayed in reasoning (0 content).
         """
         reasoning, content = simulate_reasoning_streaming(
@@ -1550,7 +1541,7 @@ class TestMidReasoningCitations:
         assert content == "Answer."
 
     def test_code_span_cited_think_start_raw(self, parser):
-        # Inside backticks the tag is fullwidth-neutralized (never HTML-escaped):
+        # Inside backticks the tag is HTML-escaped (not raw):
         # client-side tool-markup scanners must not match the raw literal.
         reasoning, _ = simulate_reasoning_streaming(
             parser,
@@ -1563,12 +1554,11 @@ class TestMidReasoningCitations:
                 (3,),
             ],
         )
-        assert f"`{_fw_tag('<think>')}`" in reasoning
+        assert f"`{_esc_tag('<think>')}`" in reasoning
         assert "<think>" not in reasoning
-        assert "&lt;" not in reasoning
 
     def test_code_span_cited_think_end_raw(self, parser):
-        """Text-form `` `</think>` `` stays reasoning as fullwidth prose.
+        """Text-form `` `</think>` `` stays reasoning as HTML-escaped prose.
 
         Special-id TE inside an open span force-commits (see inline special
         TE tests); citations must use text/BPE.
@@ -1583,11 +1573,10 @@ class TestMidReasoningCitations:
             ],
         )
         assert content == ""
-        assert f"`{_fw_tag('</think>')}`" in reasoning
+        assert f"`{_esc_tag('</think>')}`" in reasoning
         assert "</think>" not in reasoning
-        assert "&lt;" not in reasoning
 
-    def test_fenced_block_cited_tag_fullwidth(self, parser):
+    def test_fenced_block_cited_tag_escaped(self, parser):
         reasoning, _ = simulate_reasoning_streaming(
             parser,
             ["example:\n```\n", "<tool_call>", "\n``` done. ", "</think>", "A"],
@@ -1599,9 +1588,8 @@ class TestMidReasoningCitations:
                 (3,),
             ],
         )
-        assert _fw_tag("<tool_call>") in reasoning
+        assert _esc_tag("<tool_call>") in reasoning
         assert "<tool_call>" not in reasoning
-        assert "&lt;" not in reasoning
 
     def test_leading_think_start_still_stripped(self, parser):
         # Control: the legit template <think> prefix never becomes text.
@@ -1720,7 +1708,7 @@ class TestMarkdownAnswerAfterThinkEnd:
             ],
         )
         assert content == "Answer."
-        assert _fw_tag("</think>") in reasoning
+        assert _esc_tag("</think>") in reasoning
 
     def test_control_lowercase_continuation_stays_reasoning(self, parser):
         # GREEN control: bare cited tag + lowercase tail continues think.
@@ -1959,7 +1947,7 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert f"`{_fw_tag('<tool_call>')}`" in out.reasoning
+        assert f"`{_esc_tag('<tool_call>')}`" in out.reasoning
         assert "<tool_call>" not in out.reasoning
         assert self._CITE_PRE in out.reasoning
         assert '` as literal text").' in out.reasoning
@@ -1979,7 +1967,7 @@ class TestToolTagCitationServing:
             chunk_size,
         )
         assert out.reasoning == "thinking."
-        assert f"`{_fw_tag('<tool_call>')}`" in out.content
+        assert f"`{_esc_tag('<tool_call>')}`" in out.content
         assert "<tool_call>" not in out.content
         assert self._CITE_PRE in out.content
         assert "Tail continues." in out.content
@@ -2015,7 +2003,7 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert f"`{_fw_tag('<tool_call>')}`" in out.reasoning
+        assert f"`{_esc_tag('<tool_call>')}`" in out.reasoning
         assert "<tool_call>" not in out.reasoning
         assert '` as literal text").' in out.reasoning
         assert out.content == "Answer."
@@ -2033,7 +2021,7 @@ class TestToolTagCitationServing:
             ],
             chunk_size,
         )
-        assert f"`{_fw_tag('<tool_call>')}`" in out.content
+        assert f"`{_esc_tag('<tool_call>')}`" in out.content
         assert "<tool_call>" not in out.content
         assert "Tail continues." in out.content
         assert out.tool_calls == []
@@ -2098,7 +2086,7 @@ class TestBacktickCitationHoldback:
         )
         assert "Treat `" in reasoning
         assert "as implicit reasoning end." in reasoning
-        assert _fw_tag("<tool_call>") in reasoning
+        assert _esc_tag("<tool_call>") in reasoning
         assert "<tool_call>" not in reasoning
         assert content == "Answer."
 
@@ -2120,7 +2108,7 @@ class TestBacktickCitationHoldback:
         out = collect_output(deltas)
         assert "Treat `" in out.reasoning
         assert "as implicit reasoning end." in out.reasoning
-        assert _fw_tag("<tool_call>") in out.reasoning
+        assert _esc_tag("<tool_call>") in out.reasoning
         assert out.content == "Answer."
         assert out.tool_calls == []
 
@@ -2176,14 +2164,13 @@ class TestProseMaskDelimiterStrip:
     def test_mask_end_after_tools_stripped_tools_still_emit(
         self, mock_tokenizer, mock_request
     ):
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionToolsParam,
-        )
-
         from tests.parser.engine.streaming_helpers import (
             collect_content,
             collect_function_name,
             simulate_tool_streaming,
+        )
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
         )
 
         tools = [

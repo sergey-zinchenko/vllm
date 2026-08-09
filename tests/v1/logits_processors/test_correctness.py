@@ -1269,6 +1269,99 @@ def test_thinking_budget_long_thinking_section_end_marker_found_at_correct_index
     )
 
 
+def test_thinking_budget_skips_citation_shaped_think_end():
+    """`` `\n</think>`` must not clear end_thinking / disable budget force."""
+    from vllm.parser.qwen3_phase_stop import (
+        CITATION_NUDGE_XARG_KEY,
+        PHASE_BAN_XARG_KEY,
+    )
+
+    backtick, newline = 40, 198
+    budget = 3
+    h = ThinkingBudgetStateHolder(
+        MockReasoningConfig(), 8, 0, torch.device("cpu"), False
+    )
+    out: list[int] = []
+    params = SamplingParams(
+        thinking_token_budget=budget,
+        extra_args={
+            PHASE_BAN_XARG_KEY: [
+                30,
+                THINK_START_TOKEN_ID,
+                THINK_END_TOKEN_ID,
+                -1,
+                -1,
+                1,
+                backtick,
+                -1,
+            ],
+            CITATION_NUDGE_XARG_KEY: [50, 51, 0, newline],
+        },
+    )
+    h.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[(0, params, None, out)],
+            moved=(),
+        )
+    )
+    for tok in (
+        THINK_START_TOKEN_ID,
+        1,
+        backtick,
+        newline,
+        THINK_END_TOKEN_ID,
+        2,
+        3,
+    ):
+        out.append(tok)
+        h.update_state([out], None, None)
+        assert h._state[0]["end_thinking"] == -1, (
+            "citation-shaped TE must not latch end_thinking"
+        )
+    assert h._state[0].get("in_end", False), (
+        "budget must still force TE after citation-shaped TE"
+    )
+
+    # Separate request: real TE after a citation still exits naturally.
+    h2 = ThinkingBudgetStateHolder(
+        MockReasoningConfig(), 8, 0, torch.device("cpu"), False
+    )
+    out2: list[int] = []
+    h2.sync_batch(
+        BatchUpdate(
+            batch_size=1,
+            removed=(),
+            added=[
+                (
+                    0,
+                    SamplingParams(
+                        thinking_token_budget=10_000,
+                        extra_args=params.extra_args,
+                    ),
+                    None,
+                    out2,
+                )
+            ],
+            moved=(),
+        )
+    )
+    for tok in (
+        THINK_START_TOKEN_ID,
+        1,
+        backtick,
+        newline,
+        THINK_END_TOKEN_ID,
+        2,
+        THINK_END_TOKEN_ID,
+    ):
+        out2.append(tok)
+        h2.update_state([out2], None, None)
+    assert h2._state[0]["start_thinking"] == -1
+    assert h2._state[0]["scan_offset"] == len(out2)
+
+
 # --- Thinking budget re-entry tests (issue #43708) ---
 # Regression tests: after budget forces end-of-thinking token sequence,
 # the state machine must detect and enforce budget on subsequent blocks.
