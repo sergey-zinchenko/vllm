@@ -133,6 +133,21 @@ def test_bonus_prefix_includes_full_drafts():
     assert torch.isneginf(out[0, _IM_END])
 
 
+def test_bonus_apply_accepts_bfloat16_logits():
+    """Prod crash: apply_to_bonus on raw bf16 bonus slice (dtype mismatch)."""
+    out_ids: list[int] = [_THINK_END, 1]
+    proc = _make_processor(out_ids)
+    drafts = [[_SPACE_BACKTICK, _NEWLINE]]
+    logits = torch.zeros(1, _VOCAB, dtype=torch.bfloat16)
+    out = proc.apply_to_bonus(
+        logits.clone(),
+        draft_token_ids=drafts,
+        spec_token_ids=[[]],
+    )
+    assert out.dtype == torch.bfloat16
+    assert torch.isneginf(out[0, _BANG])
+
+
 def test_split_draft_token_ids():
     flat = torch.tensor([40, 0, 198, 0], dtype=torch.int32)
     assert RejectionSampler._split_draft_token_ids(flat, [2, 2]) == [

@@ -487,13 +487,16 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
         tok_deltas: list[int],
         val_deltas: list[float],
     ) -> torch.Tensor:
+        # Bonus logits are still model dtype (bf16) when apply_to_bonus runs;
+        # target/sampler paths are float32. Match destination dtype for index_put_.
+        neg_inf = self.neg_inf_tensor.to(dtype=logits.dtype)
         if row_bans:
             logits.index_put_(
                 (
                     self._device_tensor(row_bans, torch.int32),
                     self._device_tensor(tok_bans, torch.int32),
                 ),
-                self.neg_inf_tensor,
+                neg_inf,
             )
         if row_deltas:
             logits.index_put_(
@@ -501,7 +504,7 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
                     self._device_tensor(row_deltas, torch.int32),
                     self._device_tensor(tok_deltas, torch.int32),
                 ),
-                self._device_tensor(val_deltas, torch.float32),
+                self._device_tensor(val_deltas, logits.dtype),
                 accumulate=True,
             )
         return logits
