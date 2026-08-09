@@ -128,6 +128,10 @@ class RejectionSampler(nn.Module):
 
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
+        # Real drafts under verification (not empty sampling_metadata placeholders).
+        draft_token_id_lists = self._split_draft_token_ids(
+            metadata.draft_token_ids, metadata.num_draft_tokens
+        )
 
         # When indexing with a tensor (bonus_logits_indices), PyTorch
         # creates a new tensor with separate storage from the original
@@ -135,6 +139,15 @@ class RejectionSampler(nn.Module):
         # won't affect the original logits tensor.
         assert logits is not None
         bonus_logits = logits[bonus_logits_indices]
+        # Phase-ban bonus with accepted+full drafts (Sampler.apply alone
+        # only sees accepted and misses a backtick inside the draft).
+        for processor in sampling_metadata.logitsprocs.all:
+            if isinstance(processor, Qwen3PhaseStopLogitsProcessor):
+                bonus_logits = processor.apply_to_bonus(
+                    bonus_logits,
+                    draft_token_ids=draft_token_id_lists,
+                    spec_token_ids=sampling_metadata.spec_token_ids,
+                )
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
@@ -163,7 +176,10 @@ class RejectionSampler(nn.Module):
             # apply_logits_processors modifies the tensor in-place.
             target_logits = target_logits.clone()
         target_logits = self.apply_logits_processors(
-            target_logits, sampling_metadata, metadata
+            target_logits,
+            sampling_metadata,
+            metadata,
+            draft_token_id_lists=draft_token_id_lists,
         )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
@@ -295,6 +311,7 @@ class RejectionSampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         metadata: SpecDecodeMetadata,
+        draft_token_id_lists: list[list[int]] | None = None,
     ) -> torch.Tensor:
         has_penalties = not sampling_metadata.no_penalties
         any_penalties_or_bad_words = (
@@ -335,6 +352,11 @@ class RejectionSampler(nn.Module):
                 logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens
             )
 
+        if draft_token_id_lists is None:
+            draft_token_id_lists = self._split_draft_token_ids(
+                metadata.draft_token_ids, metadata.num_draft_tokens
+            )
+
         # MinP is argmax-invariant (skipped for greedy) but must still run
         # under temperature sampling during rejection verification.
         for processor in sampling_metadata.logitsprocs.all:
@@ -351,6 +373,7 @@ class RejectionSampler(nn.Module):
                         logits,
                         metadata.num_draft_tokens,
                         spec_token_ids=sampling_metadata.spec_token_ids,
+                        draft_token_ids=draft_token_id_lists,
                     )
                 else:
                     logits = processor.apply_with_spec_decode(
@@ -364,6 +387,20 @@ class RejectionSampler(nn.Module):
                 spec_token_ids=sampling_metadata.spec_token_ids,
             )
         return logits
+
+    @staticmethod
+    def _split_draft_token_ids(
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: list[int],
+    ) -> list[list[int]]:
+        """Split flat ``[num_tokens]`` drafts into per-request lists."""
+        flat = draft_token_ids.tolist()
+        out: list[list[int]] = []
+        offset = 0
+        for n in num_draft_tokens:
+            out.append(flat[offset : offset + n])
+            offset += n
+        return out
 
     @staticmethod
     def apply_penalties(

@@ -528,19 +528,81 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             logits, row_bans, tok_bans, row_deltas, tok_deltas, val_deltas
         )
 
+    @staticmethod
+    def _nonempty_draft_for_req(
+        req_idx: int,
+        *,
+        draft_token_ids: list[list[int]] | None,
+        spec_token_ids: list[list[int]] | None,
+    ) -> list[int] | None:
+        """Prefer real metadata drafts; ignore empty ``spec_token_ids`` placeholders.
+
+        ``sampling_metadata.spec_token_ids`` is often ``[]`` per request while
+        ``SpecDecodeMetadata.draft_token_ids`` holds the drafts under
+        verification. Treating ``[]`` as a valid draft made every MTP row use
+        the accepted-only prefix, so ``[backtick, bang]`` skipped the bang ban
+        (chatcmpl-8919ee).
+        """
+        if draft_token_ids is not None and req_idx < len(draft_token_ids):
+            draft = draft_token_ids[req_idx]
+            if draft:
+                return list(draft)
+        if spec_token_ids is not None and req_idx < len(spec_token_ids):
+            spec = spec_token_ids[req_idx]
+            if spec:
+                return list(spec)
+        return None
+
+    def apply_to_bonus(
+        self,
+        logits: torch.Tensor,
+        draft_token_ids: list[list[int]] | None = None,
+        spec_token_ids: list[list[int]] | None = None,
+    ) -> torch.Tensor:
+        """Ban on bonus rows with ``accepted + full drafts`` prefix.
+
+        Bonus is sampled assuming all drafts are accepted; without the draft
+        suffix a dangling `` ` `` inside the draft would not ban ``!``.
+        """
+        if not self.reqs:
+            return logits
+        row_bans: list[int] = []
+        tok_bans: list[int] = []
+        row_deltas: list[int] = []
+        tok_deltas: list[int] = []
+        val_deltas: list[float] = []
+        for req_idx, state in self.reqs.items():
+            draft = self._nonempty_draft_for_req(
+                req_idx,
+                draft_token_ids=draft_token_ids,
+                spec_token_ids=spec_token_ids,
+            )
+            prefix: Sequence[int] = list(state[1]) + (draft or [])
+            banned, deltas = self._step_bans_and_deltas(prefix, state)
+            for tid in banned:
+                row_bans.append(req_idx)
+                tok_bans.append(tid)
+            for tid, delta in deltas:
+                row_deltas.append(req_idx)
+                tok_deltas.append(tid)
+                val_deltas.append(delta)
+        return self._apply_bans_and_deltas(
+            logits, row_bans, tok_bans, row_deltas, tok_deltas, val_deltas
+        )
+
     def apply_with_spec_decode(
         self,
         logits: torch.Tensor,
         num_draft_tokens: list[int],
         spec_token_ids: list[list[int]] | None = None,
+        draft_token_ids: list[list[int]] | None = None,
     ) -> torch.Tensor:
         """Ban phase ids per draft row using accepted + prior draft tokens.
 
-        Without *spec_token_ids*, the accepted-output ban set is applied to
-        every draft row (legacy). With drafts, row ``k`` uses
-        ``accepted + draft[:k]`` so `` `\n</think>`` cannot sneak through
-        MTP as a single multi-token accept (production chatcmpl-8b9c).
-        Citation text-path deltas use the same per-row prefixes.
+        Prefer non-empty *draft_token_ids* (from ``SpecDecodeMetadata``) over
+        possibly empty *spec_token_ids* placeholders. Row ``k`` uses
+        ``accepted + draft[:k]`` so `` `\n</think>`` / `` `!`` cannot sneak
+        through MTP as a single multi-token accept.
         """
         if not self.reqs:
             return logits
@@ -558,10 +620,10 @@ class Qwen3PhaseStopLogitsProcessor(LogitsProcessor):
             if n <= 0:
                 continue
             offset = int(cumsum[req_idx])
-            draft = (
-                spec_token_ids[req_idx]
-                if spec_token_ids is not None and req_idx < len(spec_token_ids)
-                else None
+            draft = self._nonempty_draft_for_req(
+                req_idx,
+                draft_token_ids=draft_token_ids,
+                spec_token_ids=spec_token_ids,
             )
             accepted = list(state[1])
             for k in range(n):
