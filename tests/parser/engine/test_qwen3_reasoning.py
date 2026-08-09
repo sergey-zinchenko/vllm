@@ -1139,22 +1139,23 @@ class TestMarkdownInertStructuralTags:
         _assert_tag_visible(reasoning, "</think>")
         assert "discussion continues" in reasoning
 
-    def test_streaming_inline_special_think_end_exits_to_content(self, parser):
-        """Special ``</think>`` inside open `` ` `` must leave reasoning.
+    def test_streaming_inline_special_think_end_citation_stays_reasoning(
+        self, parser
+    ):
+        """Inline ``Treat `</think>` as implicit…`` must not end think.
 
-        Production chatcmpl-892494: model cited the tag after an opening
-        backtick; markdown-inert escaping kept the FSM in REASONING while
-        the sampler latch closed think — entire answer streamed as reasoning.
-        Special-id TE in code force-commits; closing `` ` `` + Uppercase
-        answer must land in content.
+        Production chatcmpl-ab6a7ab: special TE after an opening backtick
+        force-committed out of reasoning; the answer then looped on
+        ``Treat</think> as implicit reasoning end…``. Sticky abort on the
+        closing `` ` as…`` keeps the citation in reasoning.
         """
         reasoning, content = simulate_reasoning_streaming(
             parser,
             [
-                "before `",
+                'the snippet says "Treat `',
                 "</think>",
-                "`",
-                "\n\nAnswer follows.",
+                "` as implicit reasoning end in Qwen3 (#35687)`. ",
+                "Still thinking about the PR.",
             ],
             [
                 (1,),
@@ -1163,26 +1164,45 @@ class TestMarkdownInertStructuralTags:
                 (3,),
             ],
         )
+        assert "Treat" in reasoning or "snippet" in reasoning
+        assert "as implicit reasoning end" in reasoning
+        assert "Still thinking about the PR." in reasoning
+        assert not content
+        assert "＜/think＞" not in reasoning
+
+    def test_streaming_fenced_special_think_end_exits_to_content(self, parser):
+        """Special ``</think>`` inside a ``` fence still leaves reasoning.
+
+        Fence-stuck answers (chatcmpl-86dedb / 892494 class) keep
+        force-commit; only inline citations use sticky abort.
+        """
+        reasoning, content = simulate_reasoning_streaming(
+            parser,
+            [
+                "before\n```\n",
+                "</think>",
+                "\n```\n\nAnswer follows.",
+            ],
+            [
+                (1,),
+                (_THINK_END_ID,),
+                (2,),
+            ],
+        )
         assert "before" in reasoning
         assert "Answer follows." in content
         assert "Answer follows." not in reasoning
         assert "＜/think＞" not in reasoning
         assert "&lt;/think&gt;" not in reasoning
 
-    def test_streaming_inline_special_think_end_citation_tail_to_content(
-        self, parser
-    ):
-        """Same-delta closing `` `), and…`` after special TE still commits.
-
-        Sticky would treat the closing backtick as false continuation and
-        swallow the rest of the turn into reasoning (892494 shape).
-        """
+    def test_streaming_fenced_special_think_end_then_answer(self, parser):
+        """After fenced special TE, following prose is content."""
         reasoning, content = simulate_reasoning_streaming(
             parser,
             [
-                "before `",
+                "notes:\n```\n",
                 "</think>",
-                "`), and the standard parser continues.\n\n",
+                "\n```\n\n",
                 "Всё, ответ готов.",
             ],
             [
@@ -1192,7 +1212,7 @@ class TestMarkdownInertStructuralTags:
                 (3,),
             ],
         )
-        assert "before" in reasoning
+        assert "notes" in reasoning
         assert "Всё, ответ готов." in content
         assert "Всё, ответ готов." not in reasoning
         assert "＜/think＞" not in reasoning

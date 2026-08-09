@@ -518,10 +518,11 @@ class StreamingParserEngine:
         # Inside markdown code: structural tags are inert prose — except
         # THINK_END (fence and inline). An unclosed ``` or open `` ` ``
         # would otherwise swallow ``</think>`` as escaped code prose and
-        # leave the answer stuck in reasoning (chatcmpl-86dedb fence;
-        # chatcmpl-892494 inline citation of the special id). Text/BPE
-        # `` `</think>` `` citations still go through THINK_END_PENDING
-        # sticky; special-id TE in code force-commits (see below).
+        # leave the answer stuck in reasoning (chatcmpl-86dedb fence).
+        # Text/BPE and inline special-id `` `</think>` `` citations use
+        # THINK_END_PENDING sticky; special-id TE in a *fence* may
+        # force-commit (see below). Inline special TE must not force-commit
+        # (chatcmpl-ab6a7ab: ``Treat `</think>` as implicit…``).
         if (
             in_markdown_code
             and self._is_structural_terminal(terminal)
@@ -594,13 +595,15 @@ class StreamingParserEngine:
         elif self.state == ParserState.TOOL_ARGS and terminal == "PARAM_END":
             self._param_depth = max(0, self._param_depth - 1)
 
-        # Special-id TE inside markdown code: next non-empty text commits.
-        # Sticky abort would put the whole answer back into reasoning
-        # (chatcmpl-892494: ``before `</think>`), and…``).
+        # Special-id TE inside a fenced ``` block: next non-empty text
+        # commits (chatcmpl-86dedb / 892494 fence-stuck answers). Inline
+        # `` `</think>` `` citations must use sticky abort instead —
+        # force-commit there ends think mid-quote and dumps the rest into
+        # content (chatcmpl-ab6a7ab Treat/`</think>`/as-implicit loop).
         if (
             terminal == "THINK_END"
             and from_special_id
-            and in_markdown_code
+            and self._md_in_fence
             and self.state == ParserState.REASONING
         ):
             self._think_end_pending_force_commit = True
